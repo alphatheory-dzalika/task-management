@@ -1,0 +1,1 @@
+This includes the components of Atomic Adapter 
