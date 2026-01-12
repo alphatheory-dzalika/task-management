@@ -1,5 +1,111 @@
 # Product and Themes Catalog Discovery
 
+---
+
+## Document Index
+
+### Level 1: Major Sections
+
+| Section | Description |
+|---------|-------------|
+| [Purpose](#purpose) | Document goals and foundation |
+| [Source Projects Analyzed](#source-projects-analyzed) | 6 projects surveyed |
+| [Products Discovered](#products-discovered) | 12 products (P1-P12) |
+| [Themes Discovered](#themes-discovered) | 10 themes (T1-T10) |
+| [Product-Theme Matrix](#product-theme-matrix) | Cross-reference grid |
+| [MCP Integration Roadmap](#mcp-integration-roadmap) | 4-phase MCP buildout |
+| [FactSet Migration Program](#factset-migration-program) | 6-phase migration plan |
+| [Cross-Team Communication Model](#cross-team-communication-model) | Collaboration framework |
+| [JIRA & Documentation Infrastructure](#jira--documentation-infrastructure-discovery) | 1,627 files cataloged |
+| [Product Documentation Index](#product-documentation-index) | Folder inventory |
+| [Next Steps](#next-steps) | Action items |
+
+---
+
+### Level 2: Products Detail
+
+#### Core Portfolio Platform (DPTv2)
+| Product | Link | Status |
+|---------|------|--------|
+| P1: Portfolio Calculations Engine | [Details](#p1-portfolio-calculations-engine) | Production |
+| P2: Estimates Feature | [Details](#p2-estimates-feature) | In Progress |
+| P3: Market Data Integration | [Details](#p3-market-data-integration) | Production |
+| P4: Custom Logic & Extensibility | [Details](#p4-custom-logic--extensibility) | Production |
+
+#### Data Integration (IDM/DME)
+| Product | Link | Status |
+|---------|------|--------|
+| P5: Ticker Resolution (Guidepost) | [Details](#p5-ticker-resolution--symbology-guidepost-system) | Production |
+| P6: Adapter Instructions | [Details](#p6-adapter-instructions-instruction-containers) | Production |
+| P7: External App Data | [Details](#p7-external-app-data-integration) | Production |
+| P8: Portfolio Mapping | [Details](#p8-portfolio-mapping) | Production |
+
+#### Research & Analytics
+| Product | Link | Status |
+|---------|------|--------|
+| P9: RAPI (Research API) | [Details](#p9-rapi-research-api) | Production |
+| P10: Fund Asset Aggregation | [Details](#p10-fund-asset-aggregation) | Active Dev |
+
+#### Client & Knowledge
+| Product | Link | Status |
+|---------|------|--------|
+| P11: Client Knowledge & CX | [Details](#p11-client-knowledge--cx-servicing) | Active Dev |
+| P12: Historical Data | [Details](#p12-historical-data-management) | Active Dev |
+
+---
+
+### Level 2: Themes Detail
+
+| Theme | Link | Purpose |
+|-------|------|---------|
+| T1: MCPs | [Details](#t1-mcps-model-context-protocol) | AI tool integration |
+| T2: Data Flow | [Details](#t2-data-flow-architecture) | Data movement patterns |
+| T3: Job Orchestration | [Details](#t3-job-orchestration) | Job management |
+| T4: Entity Identity | [Details](#t4-entity-identity-management) | Entity resolution |
+| T5: Config-Driven | [Details](#t5-configuration-driven-processing) | Declarative rules |
+| T6: Calculation Pipeline | [Details](#t6-calculation-pipeline) | Financial calcs |
+| T7: Vendor APIs | [Details](#t7-vendor-api-integration) | External API patterns |
+| T8: Data Storage | [Details](#t8-data-storage) | Persistence patterns |
+| T9: Documentation Funnel | [Details](#t9-documentation-funnel) | Knowledge capture |
+| T10: Multi-Scenario | [Details](#t10-multi-scenario-modeling) | Scenario analysis |
+
+---
+
+### Level 2: FactSet Migration Phases
+
+| Phase | Link | Target |
+|-------|------|--------|
+| Phase 0: Ticker Stabilization | [Outcomes](#phase-0-outcomes-complete) | Done |
+| Phase 1: EOD Pricing | [Path to Prod](#eod-pricing-scoring---path-to-production) | Code Complete |
+| Phase 2-5: Jan-Apr 2026 | [Roadmap](#phase-roadmap) | In Progress |
+| Phase 6: Ticker as Product | [Details](#ticker-as-data-product-phase-6) | Q2 2026 |
+
+---
+
+### Level 2: Documentation Infrastructure
+
+| Section | Link | Key Info |
+|---------|------|----------|
+| JIRA Integration | [Details](#jira-integration-documents) | 6 JIRA docs |
+| IDM Documentation | [Details](#idm-documentation-inventory-dme-project) | 16 IDM files |
+| Ticket-Referenced | [Details](#ticket-referenced-documentation) | IDM-*, IN-* patterns |
+| Roadmaps | [Details](#roadmap-documents-across-projects) | 7 roadmap docs |
+| By Project Size | [Details](#documentation-by-project-size) | dptv2: 861, dme: 354 |
+
+---
+
+### Related Product Documentation (External Links)
+
+| Folder | Files | Link |
+|--------|-------|------|
+| Ticker Resolver Guidepost | 5 | [products/ticker-resolver-guidepost/](products/ticker-resolver-guidepost/) |
+| External-to-Internal Data | 5 | [products/external-to-internal-data-and-vice-versa/](products/external-to-internal-data-and-vice-versa/) |
+| StateBean Processing | 1 | [products/state-bean-field-processing/](products/state-bean-field-processing/) |
+| Ticker Processing | 1 | [products/ticker-processing/](products/ticker-processing/) |
+| Market Data Providers | 2 | [products/market-data-provider-systems/](products/market-data-provider-systems/) |
+
+---
+
 ## Purpose
 
 This discovery document captures capabilities found across Alpha Theory's major codebases to inform the products and themes architecture in tracking-review. It serves as the foundation for:
@@ -120,28 +226,37 @@ This discovery document captures capabilities found across Alpha Theory's major 
 
 ### Category 2: Data Integration (IDM/DME)
 
-#### P5: Ticker Resolution & Symbology
+#### P5: Ticker Resolution & Symbology (GUIDEPOST SYSTEM)
 
 **Source**: OpenAdapter (primary), DME
-**Status**: Production
+**Status**: Production (CDC-Based Architecture)
+
+**DETAILED DOCUMENTATION**: `products/ticker-resolver-guidepost/`
 
 **Capabilities**:
 - Resolve 60+ security types (equities, options, futures, bonds, baskets)
 - Multi-source validation (FIGI, FactSet, Bloomberg)
 - Scoring-based selection with tie-breaking
-- 4-phase atomic workflow:
-  1. Data Extraction
-  2. Symbology Extraction
-  3. FIGI Batch Assignment
-  4. Ticker Resolution
+- **5-phase CDC-based processing** (Guidepost Architecture):
+  1. Process StateBeans (NO SecMaster)
+  2. Batch INSERT via CDC
+  3. TickerMaster Isolation (ONLY SecMaster contact)
+  4. Build SecMasterTicker from ATDBTicker
+  5. Process Ticker Histories
 
-**Key Components**:
-- `TickerResolverServices.java` (2,781 lines)
-- `OpenFigiFactSetSymbologyExtractionServices.java` (1,786 lines)
-- `ClientSourceDataFileInstanceOpenFigiRequestManager.java` (959 lines)
+**Guidepost System (9 Classes, 6,096 Lines)**:
+- `TickerFactoryForIdmServicesGuidepost` (2,476 lines) - Main orchestrator
+- `TickerFinderGuidepost` (816 lines) - Cache resolution
+- `TickerCreatorGuidepost` (754 lines) - CDC-based creation
+- `OptionTickerProcessorGuidepost` (623 lines) - Option handling
+- `SecMasterBridgeGuidepost` (298 lines) - Isolated SecMaster calls
+
+**Key Innovation**: CDC-first architecture - database writes auto-sync via Debezium to TickerCache, eliminating direct SecMaster calls during batch processing.
+
+**FactSet Migration Integration**: See `products/ticker-resolver-guidepost/FACTSET_MIGRATION_PLAN.md`
 
 **MCP Opportunity**: `ticker-resolution-mcp`
-- Tools: resolve_ticker, validate_symbology, get_figi_mapping, explain_resolution
+- Tools: resolve_ticker, batch_resolve_tickers, get_ticker_cache_status, inspect_phase_3_queue
 
 ---
 
@@ -584,6 +699,62 @@ alpha-knowledge  idm-knowledge  factset-estimates
 
 ---
 
+## FACTSET MIGRATION PROGRAM
+
+**Status**: Active Migration Program
+**Target**: Q2 2026 for Ticker as Data Product
+**Detailed Plan**: `products/ticker-resolver-guidepost/FACTSET_MIGRATION_PLAN.md`
+
+### Phase Roadmap
+
+| Phase | Focus | Target | Status |
+|-------|-------|--------|--------|
+| **0** | Ticker Stabilization & Quick Wins | Complete | Done |
+| **1** | EOD Pricing (Scoring) | Staging/Prod | Code Complete |
+| **2** | Prices: Intraday | Jan-Apr 2026 | Not Started |
+| **3** | Prices: THCalcServices & SecMaster & TickerHistory | Jan-Apr 2026 | In Progress |
+| **4** | Black-Scholes | Jan-Apr 2026 | Planning |
+| **5** | Find or Create Ticker & FoC FundAsset | Jan-Apr 2026 | Planning |
+| **6** | Ticker as Data Product | Q2 2026 | Future |
+
+**Milestone**: Upon Phase 2 completion, ready to pay FactSet licensing
+
+### Phase 0 Outcomes (Complete)
+
+| Metric | Value |
+|--------|-------|
+| Fund Assets Processed | 11,116 |
+| Unique Equity Tickers | ~3,500 |
+| Assets Updated | 153 |
+| Active Research Impact | 19 (minimal) |
+| Parent/ADR Linkages Added | 3,304 |
+| Descriptions Updated | 2,835 |
+| FactSet IDs Updated | 688 |
+| Bloomberg Tickers Normalized | 226 |
+
+### EOD Pricing (Scoring) - Path to Production
+
+**Staging Requirements**:
+- Run in staging environment
+- Conform results in Ticker/FundAsset ExternalAppData
+- Confirm ATSettings / DepartmentSettings usage
+
+**Production Prerequisites**:
+- Add new intermediate-stage data tables in prod
+- Run IDM as a .jar in adapter (ATOP pattern)
+- Final ATSettings / DepartmentSettings validation
+
+### Ticker as Data Product (Phase 6)
+
+**Key Initiatives**:
+1. **JTIC Decommissioning**: Bloomberg Composite Ticker as new standard
+2. **Ticker Consolidation**: Rule for determining primary when duplicates exist
+3. **Delisting Process**: expired/delisted handling, YTD portfolio support
+4. **Lifecycle Orchestration**: Corporate actions, identifier changes
+5. **External Services**: CBP & Masterfile support, Ticker Lookup service
+
+---
+
 ## CROSS-TEAM COMMUNICATION MODEL
 
 ### How This Catalog Enables Collaboration
@@ -809,25 +980,57 @@ Active/Recent IDM tickets found in git logs:
 
 ---
 
+## PRODUCT DOCUMENTATION INDEX
+
+### Populated Product Folders
+
+| Folder | Documents | Description |
+|--------|-----------|-------------|
+| `products/ticker-resolver-guidepost/` | 5 files | Complete Guidepost architecture |
+| `products/external-to-internal-data-and-vice-versa/` | 5 files | RAPI and data model docs |
+| `products/state-bean-field-processing/` | 1 file | StateBean processing |
+| `products/ticker-processing/` | 1 file | Symbology validation |
+| `products/market-data-provider-systems/` | 2 files | FactSet, client providers |
+
+### Ticker Resolver Guidepost Documentation
+
+| File | Purpose |
+|------|---------|
+| `TICKER_RESOLVER_GUIDEPOST_OVERVIEW.md` | Architecture overview, 9-class inventory |
+| `PHASE_BY_PHASE_PROCESSING.md` | Detailed 5-phase breakdown |
+| `FINDORCREATE_TICKER_ABSTRACTION.md` | Future abstraction design |
+| `FACTSET_MIGRATION_PLAN.md` | 6-phase migration roadmap |
+| `KNOWN_ISSUES_AND_FIXES.md` | P0-P3 prioritized fixes |
+
+---
+
 ## NEXT STEPS
+
+### Completed
+- [x] Initial discovery across 6+ projects
+- [x] Product/Theme catalog structure
+- [x] JIRA/Documentation infrastructure mapping
+- [x] Ticker Resolver Guidepost detailed documentation
+- [x] FactSet Migration Plan integration
 
 ### Immediate
 1. Review this discovery with stakeholders
-2. Prioritize products for detailed documentation
+2. Validate FactSet Migration phase priorities
 3. Identify first MCP to build from this catalog
 
 ### Short-Term
-4. Populate `/products/` directories
+4. Continue populating `/products/` directories
 5. Populate `/themes/mcps/` with architecture
 6. Create product-to-MCP mapping specs
 
 ### Medium-Term
-7. Implement prioritized MCPs
+7. Implement prioritized MCPs (ticker-resolution-mcp first)
 8. Integrate with alpha-gateway for routing
 9. Establish cross-team review cadence
 
 ---
 
 *Discovery Date: January 2026*
+*Last Updated: January 10, 2026*
 *Sources: dme, openAdapter, dptv2, internal-alpha-theory-mcp*
-*Status: DRAFT - Initial Discovery Complete*
+*Status: DRAFT - Guidepost Documentation Complete*
