@@ -945,7 +945,7 @@ The Missing Step
 Step 0: TickerMapping.snapshots.tickers_with_holding_counts
 (ticker universe from client holdings)
 ↓
-Step 1: Vendors.fds.ticker_factset_coverage_summary  ← THIS IS MISSING FROM OUR PLAN
+Step 1: Vendors.fds.ticker_factset_price_coverage_summary  ← THIS IS MISSING FROM OUR PLAN
 (enriches with fsym_id, region_code, exchange, etc.)
 ↓
 Step 2: fds_tracking.ca_pipeline_queue
@@ -4936,7 +4936,7 @@ the actual workflows
   2. Vendors.fds.build_ticker_factset_price_coverage_summary
 
   INIT (first-time processing):
-  - First run ever: INIT all tickers in ticker_factset_coverage_summary
+  - First run ever: INIT all tickers in ticker_factset_price_coverage_summary
   - Go-forward: Only new tickers (not yet in fsym_ca_status) get INIT-ed
 
   TOPOFF (daily regional processing):
@@ -11430,3 +11430,7 @@ What you can do (workarounds, not solutions):
 3. Use /compact manually before auto-compact hits (gives you control of the summary)
 
 But honestly? 38 compacts in a day while doing serious work is a product problem, not a user problem. You shouldn't need 11,400 lines of notes to work with an AI assistant.
+
+
+
+

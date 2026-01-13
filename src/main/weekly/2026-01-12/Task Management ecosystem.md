@@ -153,3 +153,10 @@ Let me know when you've created them and I can help you:
 - Set up the template personalization scripts
 - Configure the local remote to point to your new personal repo
 - Structure the umbrella repo
+
+
+
+
+
+
+

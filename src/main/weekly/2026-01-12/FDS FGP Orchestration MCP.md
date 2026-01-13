@@ -719,3 +719,765 @@ Should we design the metadata schema first - the structure that holds all of thi
 
 
 
+● Here's what we built for recovery:
+
+Recovery Tools Summary
+
+After compaction, Claude can call fds_project_state which returns:
+
+{
+"message": "FDS FGP Orchestration MCP - Project State",
+"registry_stats": { pipelines, entities, stages, milestones... },
+"pipelines": [ list of registered pipelines ],
+"recent_changes": [ last 5 changes with descriptions ],
+"roadmap_summary": { progress_pct, done_tasks, total_tasks },
+"session_state": { working_on, current_stage, next_steps },
+"recovery_hint": "Use fds_roadmap to see milestones..."
+}
+
+Key recovery tools:
+┌───────────────────────┬────────────────────────────────────────────┐
+│         Tool          │                  Purpose                   │
+├───────────────────────┼────────────────────────────────────────────┤
+│ fds_project_state     │ Call this first - comprehensive state dump │
+├───────────────────────┼────────────────────────────────────────────┤
+│ fds_roadmap           │ See milestones, tasks, what's in progress  │
+├───────────────────────┼────────────────────────────────────────────┤
+│ fds_browse_registry   │ Explore any metadata table                 │
+├───────────────────────┼────────────────────────────────────────────┤
+│ fds_get_session_state │ Transient session state (JSON file)        │
+└───────────────────────┴────────────────────────────────────────────┘
+Why this helps:
+
+1. Persisted in SQLite - Not lost on compaction
+2. Self-describing - Registry explains what exists
+3. Roadmap shows context - "What was being worked on?"
+4. Changes tracked - Recent modifications visible
+
+The files we created:
+- src/registry.py - SQLite registry with roadmap support
+- scripts/seed_registry.py - Populates with FDS CA metadata
+- CLAUDE.md - Quick recovery guide
+
+To test it, you'd run:
+cd /mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp
+python scripts/seed_registry.py
+
+Then after compaction, Claude Desktop would call fds_project_state and get full context.
+
+Should I commit these changes?
+
+----------------------
+
+❯ how can we operate successfully with these concepts if we don't have object oriented details?  Is there any ORM?  GLUE explanation? Catalog?
+
+● Great question - this is critical for making the pattern reusable. Let me explain the current approach and its limitations:
+
+Current approach (what we have):
+seed_registry.py (calls functions) → registry.py (Python functions) → SQLite (raw SQL)
+
+Problems:
+1. No ORM - Schema defined in raw SQL strings, easy to get mismatches
+2. No validation - Function parameters aren't validated against table schema
+3. No catalog - No centralized schema definition that both code and database reference
+
+Better patterns for any project:
+┌──────────────────┬────────────────────────────────┬──────────────────────────┐
+│     Approach     │             Tools              │       When to use        │
+├──────────────────┼────────────────────────────────┼──────────────────────────┤
+│ Python ORM       │ SQLAlchemy, Pydantic           │ Single-language projects │
+├──────────────────┼────────────────────────────────┼──────────────────────────┤
+│ AWS Glue Catalog │ Glue, Lake Formation           │ AWS data lakes           │
+├──────────────────┼────────────────────────────────┼──────────────────────────┤
+│ Schema Registry  │ Confluent, AWS Schema Registry │ Event streaming          │
+├──────────────────┼────────────────────────────────┼──────────────────────────┤
+│ JSON Schema      │ jsonschema, pydantic           │ API-first projects       │
+└──────────────────┴────────────────────────────────┴──────────────────────────┘
+Let me run the seed now to get the MCP working, then I'll show you a better pattern:
+
+● Bash(cd /mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp && python3 scripts/seed_registry.py) t
+
+----------------------
+
+
+
+● Let me verify the tool works:
+
+● Bash(cd /mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp && .venv/bin/python -c " timeout: 30s
+from src import models, schema_export…)
+⎿  === fds_describe_schema() ===
+{
+"models": [
+… +30 lines (ctrl+o to expand)
+⎿  Shell cwd was reset to /mnt/c/Users/dzalika/IdeaProjects/dptv2
+
+● Tool works. Now committing:
+
+● Bash(cd /mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp && git status)
+⎿  On branch main
+Your branch is up to date with 'origin/main'.
+… +12 lines (ctrl+o to expand)
+⎿  Shell cwd was reset to /mnt/c/Users/dzalika/IdeaProjects/dptv2
+
+● Bash(cd /mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp && git add -A && git diff --cached --stat)
+⎿   src/models.py        | 374 +++++++++++++++++++++++++++++++++++++++++++++++++++
+src/registry.py      |  19 +--
+src/schema_export.py | 353 ++++++++++++++++++++++++++++++++++++++++++++++++
+… +2 lines (ctrl+o to expand)
+⎿  Shell cwd was reset to /mnt/c/Users/dzalika/IdeaProjects/dptv2
+
+● Bash(cd /mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp && git commit -m "Add Pydantic-first schema with multi-dialect DDL export…)
+⎿  [main 0f6a66c] Add Pydantic-first schema with multi-dialect DDL export
+Committer: root <root@DZALIKA-5690.alphatheory.local>
+Your name and email address were configured automatically based
+… +14 lines (ctrl+o to expand)
+⎿  Shell cwd was reset to /mnt/c/Users/dzalika/IdeaProjects/dptv2
+
+● Committed 0f6a66c.
+
+What's Now Available
+┌─────────────────────────────────────────────┬────────────────────────────────────────────────────────────────┐
+│                  MCP Tool                   │                          What it does                          │
+├─────────────────────────────────────────────┼────────────────────────────────────────────────────────────────┤
+│ fds_describe_schema()                       │ List all models and enums                                      │
+├─────────────────────────────────────────────┼────────────────────────────────────────────────────────────────┤
+│ fds_describe_schema(model_name="Task")      │ Full chain: Pydantic → DDL (3 dialects) → OpenAPI → TypeScript │
+├─────────────────────────────────────────────┼────────────────────────────────────────────────────────────────┤
+│ fds_describe_schema(enum_name="TaskStatus") │ Valid values: [todo, in_progress, done, blocked]               │
+└─────────────────────────────────────────────┴────────────────────────────────────────────────────────────────┘
+The Pattern (reusable for any project)
+
+src/models.py         ← Define once in Pydantic
+src/schema_export.py  ← Generate everything else
+
+Agent can now ask:
+- "What fields does Milestone have?"
+- "What's the SQL Server DDL for Task?"
+- "What values are valid for status?"
+
+Push manually when ready: git push from fds-fgp-orchestration-mcp
+
+✻ Cogitated for 1m 12s
+
+❯ ok, now what to do to explain the workflows and related transformations between stages?  The stored procedures?
+⎿  Interrupted · What should Claude do instead?
+
+❯ oh!  Oops ...  these are DDLs for the different models and details that are central to this documentation system ... how do we separately have DDLs for the related FGP system?  It's
+multi-staged, many tables, many stored procedures?
+
+● Great catch - two completely different things:
+
+┌─────────────────────────────────────────────────────────────────┐
+│  LAYER 1: MCP Registry (what we just built)                     │
+│  ─────────────────────────────────────────                      │
+│  SQLite + Pydantic models for:                                  │
+│  • Milestone, Task, Scaffold (roadmap)                          │
+│  • Entity, Stage, StageIO (metadata about the pipeline)         │
+│  • This is the DOCUMENTATION SYSTEM                             │
+└─────────────────────────────────────────────────────────────────┘
+│
+│ references
+▼
+┌─────────────────────────────────────────────────────────────────┐
+│  LAYER 2: FDS FGP Pipeline (the actual system)                  │
+│  ─────────────────────────────────────────────                  │
+│  SQL Server tables:                                             │
+│  • fgp_ca_events, fgp_global_prices (source)                    │
+│  • ca_events_translated, ca_daily_factors (intermediate)        │
+│  • factset_prices_adjusted_derived (output)                     │
+│                                                                 │
+│  SQL Server stored procedures:                                  │
+│  • sp_process_ca_level1, sp_process_ca_level2, etc.             │
+│  • sp_run_ca_pipeline (orchestrator)                            │
+│                                                                 │
+│  Lives in: sql/fds_v5/ in dptv2 repo                            │
+└─────────────────────────────────────────────────────────────────┘
+
+The question: How does the MCP expose the actual DDLs and stored procedures?
+
+Let me check what already exists:
+
+
+----------------
+
+We made some progress.  And again, notice no more stress from the auto-compacting ...
+
+
+● Let me create a proper product specification with all data layers and change management.
+
+● Write(00_PRODUCT_SPECIFICATION.md)
+⎿  Wrote 375 lines to 00_PRODUCT_SPECIFICATION.md
+# FDS Corporate Actions Adjusted Price Pipeline
+**Product Name**: SQL Steps for FactSet Corporate Actions to Write Adjusted Prices
+**Version**: 1.0.0
+**Last Updated**: 2026-01-12
+**Owner**: Data Engineering
+---
+## Executive Summary
+… +365 lines (ctrl+o to expand)
+
+● Created two documents in sql/fds_stages/:
+
+1. 00_PRODUCT_SPECIFICATION.md - Master product document with:
+   ┌───────────────────┬─────────────────────────────────────────────┐
+   │      Section      │                   Content                   │
+   ├───────────────────┼─────────────────────────────────────────────┤
+   │ Layer 0-6         │ All tables, procedures, and their purposes  │
+   ├───────────────────┼─────────────────────────────────────────────┤
+   │ Independent Use   │ Example SQL for using each layer standalone │
+   ├───────────────────┼─────────────────────────────────────────────┤
+   │ Factor Comparison │ CALCULATED vs FACTSET_PRECALC differences   │
+   ├───────────────────┼─────────────────────────────────────────────┤
+   │ Processing Modes  │ INIT, TOPOFF, BACKFILL, FORCE_REFRESH       │
+   ├───────────────────┼─────────────────────────────────────────────┤
+   │ Change Management │ Version history + pending changes           │
+   ├───────────────────┼─────────────────────────────────────────────┤
+   │ Dependencies      │ Visual dependency diagram                   │
+   └───────────────────┴─────────────────────────────────────────────┘
+2. STEP11_DUAL_FACTOR_DESIGN.md - Implementation spec for CHANGE-001
+
+Key insight documented: Each layer is independently usable:
+
+Layer 3: fds.ca_events_translated     → Analyze individual CA events, dividend history
+Layer 4: fds.ca_daily_factors         → Daily adjustment factors
+Layer 5: fds.ca_cumulative_factors    → Cumulative factors (includes dividends)
+Layer 5-ALT: fgp_ca_adj_factors       → FactSet precalc (NO dividends)
+Layer 6: factset_prices_adjusted_derived → Final output
+
+The change management section has CHANGE-001: Dual Factor Source Support as the first pending change with status PROPOSED.
+
+Shall I proceed with implementing CHANGE-001, or would you like to refine the specification first?
+
+✻ Worked for 2m 23s
+
+❯ So this documentation is nice, but dangerous.  We don't know what is current, what is actionable.  I want to have some framework that understands a change management process.  Just
+naming documents, and especially, this current "Step 11", which is the result of a prior claude session, confuses the actual steps with artificial names ...    So we want to have
+some STRONG definition and to make it MCP-able throughout ...   The real layers are not as they seem here ...  Layer #1:   Entities to Select;  (sub-logic: what's the entity?
+Ticker? Currency Code?) Layer #2:  Current status of entity details;   Layer #3  Entity fulfillment Steps; (can have multiple layers of data within the steps, can have multiple
+steps. This is like Step functions );  Layer #4  Step data synthesis;   Summary layer;   Plus the basics of Init, topoff, backfill ...   .......    HERE ...   We are reviewing this
+system using the document FDS_PIPELINE_COMPLETE_EXPLANATION_AND_GLUE.md ...   and here is what ChatGPT explains ...   Fds Corporate Actions Pipeline — Step Functions + Glue
+Architecture
+FDS Corporate Actions Pipeline — Step Functions + Glue Architecture
+
+Purpose
+Translate the existing SQL-based / Glue-based Corporate Actions pipeline into a Step Functions–driven orchestration framework, where:
+
+Step Functions defines, documents, and controls the batch process
+
+AWS Glue executes deterministic data transformations
+
+Batch, steps, conditionals, and modes are first-class, visible artifacts
+
+This document answers three questions explicitly:
+
+How definitions live and are versioned
+
+How execution works end-to-end
+
+How outputs, logging, and auditability are handled
+
+1. Mental Model (Very Important)
+
+Think of the system as three layers, each with a single responsibility.
+
+┌─────────────────────────────────────────────┐
+│  Layer 1: PROCESS DEFINITION (Control Plane) │
+│  AWS Step Functions                          │
+│  - What runs                                │
+│  - In what order                            │
+│  - Under what conditions                   │
+│  - With what parameters                    │
+└─────────────────────────────────────────────┘
+│ invokes
+┌─────────────────────────────────────────────┐
+│  Layer 2: EXECUTION (Compute Plane)          │
+│  AWS Glue Jobs                               │
+│  - Spark transformations                   │
+│  - Deterministic batch logic                │
+│  - Idempotent writes                        │
+└─────────────────────────────────────────────┘
+│ writes
+┌─────────────────────────────────────────────┐
+│  Layer 3: STATE + AUDIT (Data Plane)         │
+│  S3 / Glue Catalog / Tracking Tables         │
+│  - Outputs                                  │
+│  - Batch lineage                            │
+│  - Metrics                                  │
+└─────────────────────────────────────────────┘
+
+Key rule:
+Glue never decides what to do next.
+Step Functions never transforms data.
+
+2. What Step Functions Is Doing For This Pipeline
+
+Step Functions is not replacing Glue.
+It is replacing:
+
+Stored-procedure orchestration logic
+
+Glue Workflows
+
+Implicit execution order hidden in scripts
+
+It becomes the authoritative batch specification.
+
+In your terms:
+Your Concept    Step Functions Concept
+Batch    One State Machine execution
+batch_id    Execution input parameter
+Level 1–4    Named Task States
+INIT / TOPOFF / BACKFILL / REFRESH    Choice States
+CA change detection    Conditional branch
+Skip CA rebuild    Pass State
+Retry / fail batch    Built-in semantics
+
+The JSON definition is the documentation.
+
+3. Canonical State Machine (High-Level)
+   Start
+   │
+   ├─▶ Initialize Batch
+   │
+   ├─▶ Detect Unprocessed CA Events
+   │     │
+   │     ├─▶ NO → Skip CA Levels
+   │     │
+   │     └─▶ YES → Run CA Artifact Pipeline
+   │              ├─ Level 1: Translate Events (Glue)
+   │              ├─ Level 2: Daily Aggregation (Glue)
+   │              └─ Level 3: Cumulative Factors (Glue)
+   │
+   ├─▶ Run Price Derivation (Glue)
+   │
+   ├─▶ Finalize Batch
+   │
+   End
+
+This exactly mirrors your existing logic — it just makes it explicit.
+
+4. Step Functions: Definition Layer (ASL)
+   Execution Input (Single Source of Truth)
+   {
+   "batch_id": "uuid",
+   "mode": "INIT | TOPOFF | BACKFILL | REFRESH",
+   "region_code": "N",
+   "start_date": "2022-01-01",
+   "end_date": "2026-01-11"
+   }
+
+Every Glue job receives only what it needs from this payload.
+
+Core State Machine (Simplified)
+{
+"StartAt": "InitBatch",
+"States": {
+
+
+"InitBatch": {
+"Type": "Task",
+"Resource": "arn:aws:lambda:init_batch",
+"Next": "DetectCAChanges"
+},
+
+
+"DetectCAChanges": {
+"Type": "Choice",
+"Choices": [
+{
+"Variable": "$.ca_changes_detected",
+"BooleanEquals": true,
+"Next": "CA_Level1"
+}
+],
+"Default": "SkipCA"
+},
+
+
+"CA_Level1": {
+"Type": "Task",
+"Resource": "arn:aws:glue:job/glue_ca_level1_translate",
+"Next": "CA_Level2"
+},
+
+
+"CA_Level2": {
+"Type": "Task",
+"Resource": "arn:aws:glue:job/glue_ca_level2_daily",
+"Next": "CA_Level3"
+},
+
+
+"CA_Level3": {
+"Type": "Task",
+"Resource": "arn:aws:glue:job/glue_ca_level3_cumulative",
+"Next": "RunPrices"
+},
+
+
+"SkipCA": {
+"Type": "Pass",
+"Next": "RunPrices"
+},
+
+
+"RunPrices": {
+"Type": "Task",
+"Resource": "arn:aws:glue:job/glue_price_derived",
+"Next": "FinalizeBatch"
+},
+
+
+"FinalizeBatch": {
+"Type": "Task",
+"Resource": "arn:aws:lambda:finalize_batch",
+"End": true
+}
+}
+}
+
+This JSON is the batch documentation.
+
+5. Glue Jobs: Execution Layer
+
+Glue jobs remain almost exactly as you wrote them.
+
+Glue Job Contract
+
+Each Glue job:
+
+Accepts batch_id and relevant parameters
+
+Reads only batch-scoped inputs
+
+Writes batch-partitioned outputs
+
+Emits metrics
+
+Example parameter contract:
+
+--batch_id
+--mode
+--start_date
+--end_date
+
+No Glue job:
+
+Decides execution order
+
+Knows if it is INIT vs TOPOFF beyond parameters
+
+Triggers another job
+
+This keeps Glue pure and testable.
+
+6. Outputs & State (Where Things Live)
+   Data Outputs
+   Artifact    Owner
+   ca_events_translated    Glue
+   ca_daily_factors    Glue
+   ca_cumulative_factors    Glue
+   factset_prices_adjusted_derived    Glue
+
+All outputs:
+
+Partitioned by batch_id or natural keys
+
+Immutable per batch
+
+Batch State & Audit
+Signal    Source
+Execution status    Step Functions
+Step-level timing    Step Functions
+Glue job logs    CloudWatch
+Row counts    Glue metrics
+Business completeness    Tracking tables
+
+You get two timelines:
+
+Control-plane timeline (what ran, when)
+
+Data-plane lineage (what data was produced)
+
+7. Logging & Observability
+   Step Functions
+
+Visual execution graph
+
+Per-step duration
+
+Retry / failure reasons
+
+Execution history
+
+Glue
+
+Spark logs (CloudWatch)
+
+Job metrics
+
+Custom counters (events processed, prices loaded)
+
+Recommended Additions
+
+Emit per-job metrics to CloudWatch:
+
+events_processed
+
+prices_loaded
+
+Write batch summary rows (like ca_batch_summary)
+
+8. Why This Is Better Than Glue Workflows
+   Capability    Glue Workflow    Step Functions
+   Nested logic    ❌    ✅
+   Conditional execution    ❌    ✅
+   Batch-as-object    ❌    ✅
+   Documentation value    Low    Very High
+   Replay    Manual    Native
+   Visibility    Poor    Excellent
+
+Glue Workflows collapse logic.
+Step Functions preserves intent.
+
+9. Final Takeaway
+
+What you built was already a state machine, just expressed in SQL.
+
+Step Functions makes it:
+
+Explicit
+
+Auditable
+
+Reviewable
+
+Safer to evolve
+
+Glue remains exactly where it belongs: pure computation.
+
+This separation is what allows this pipeline to scale in complexity without becoming fragile.
+
+10. Next Logical Extensions (Optional)
+
+Map State for per-fsym_id parallelism
+
+Nested state machines for CA-only rebuilds
+
+Automatic replay of failed batches
+
+Formal SLA tracking per step
+
+Bottom line:
+Step Functions defines what the pipeline is.
+Glue implements how the data is transformed.
+
+I’ve written a new, clean architecture document in the canvas that:
+
+Uses your exact pipeline (levels, batch semantics, modes, logic)
+
+Explains why Step Functions sits on top of Glue
+
+Shows how definitions, execution, outputs, and logging fit together
+
+Treats Step Functions as both documentation and control plane
+
+Keeps Glue exactly where it belongs: pure data execution
+
+How to read the document
+
+Sections 1–3 explain why Step Functions exists in this design
+
+Sections 4–6 show how it runs and where state/output lives
+
+Sections 7–9 connect observability, audit, and long-term maintainability
+
+Nothing in your Glue code is thrown away — it’s promoted into a governed framework.    ...    So ...  many points here ...  1) we need a proper change management process ...  2) we
+should translate all stages into Glue and Step Functions, even if we're still using SQL Server or Java
+
+● This is a fundamental reframe. The key insight from ChatGPT is the separation:
+
+DEFINITION (Control Plane) → What runs, in what order, under what conditions
+EXECUTION (Compute Plane)  → Pure data transformation
+STATE (Data Plane)         → Outputs, lineage, audit
+
+Let me create a proper framework that's MCP-able and has real change management.
+
+
+-----------
+
+
+● Here's the comparison:
+
+┌────────────────┬─────────────────┬───────────────────┬──────────────┐
+│ Session        │ Auto-Compacts   │ File Size         │ Work Done    │
+├────────────────┼─────────────────┼───────────────────┼──────────────┤
+│ Yesterday      │ ~40             │ 41 MB             │ SQL files,   │
+│ (Jan 11)       │ (41 continues)  │                   │ constant     │
+│                │                 │                   │ re-reading   │
+├────────────────┼─────────────────┼───────────────────┼──────────────┤
+│ TODAY          │ ~7              │ 8.1 MB            │ Built MCP:   │
+│ (Jan 12)       │ (8 continues,   │                   │ 4 new modules│
+│                │ -1 initial)     │                   │ 50+ tools    │
+└────────────────┴─────────────────┴───────────────────┴──────────────┘
+
+Why the improvement?
+
+1. Knowledge in code, not giant SQL files - Instead of re-reading 1000+ line SQL files, the structure lives in Python
+2. MCP tools are tiny - Calling sf_list() returns data, not raw file content
+3. No repeated context - The framework models are defined once, queried many times
+
+What we built this session:
+- pipeline_framework.py - Control/Compute/Data plane separation
+- pipeline_definition_v2.py - Nested pipeline model (ticker invokes CA)
+- step_functions.py - Tables vs ETL separation with lineage
+- server.py updates - 9 new MCP tools
+
+Token efficiency: 8MB today vs 41MB yesterday, doing MORE complex work (building a queryable framework vs editing SQL files).
+
+The MCP approach is working - you're spending tokens on progress, not on re-reading the same files.
+
+
+------------------
+
+
+● Here's the comparison:
+
+┌────────────────┬─────────────────┬───────────────────┬──────────────┐
+│ Session        │ Auto-Compacts   │ File Size         │ Work Done    │
+├────────────────┼─────────────────┼───────────────────┼──────────────┤
+│ Yesterday      │ ~40             │ 41 MB             │ SQL files,   │
+│ (Jan 11)       │ (41 continues)  │                   │ constant     │
+│                │                 │                   │ re-reading   │
+├────────────────┼─────────────────┼───────────────────┼──────────────┤
+│ TODAY          │ ~7              │ 8.1 MB            │ Built MCP:   │
+│ (Jan 12)       │ (8 continues,   │                   │ 4 new modules│
+│                │ -1 initial)     │                   │ 50+ tools    │
+└────────────────┴─────────────────┴───────────────────┴──────────────┘
+
+Why the improvement?
+
+1. Knowledge in code, not giant SQL files - Instead of re-reading 1000+ line SQL files, the structure lives in Python
+2. MCP tools are tiny - Calling sf_list() returns data, not raw file content
+3. No repeated context - The framework models are defined once, queried many times
+
+What we built this session:
+- pipeline_framework.py - Control/Compute/Data plane separation
+- pipeline_definition_v2.py - Nested pipeline model (ticker invokes CA)
+- step_functions.py - Tables vs ETL separation with lineage
+- server.py updates - 9 new MCP tools
+
+Token efficiency: 8MB today vs 41MB yesterday, doing MORE complex work (building a queryable framework vs editing SQL files).
+
+The MCP approach is working - you're spending tokens on progress, not on re-reading the same files.
+
+
+
+Oh no, it's run out of the limit ...  but the problem is that it's still writing to the wrong project...
+
+We have to move these items properly into fds-fgp-orchestration proejct ...
+● I see the problem clearly. Let me register this bug.
+
+Issue: fgp_ca_adj_factors.adj_factor_combined values are NOT cumulative - they appear to be individual event factors.
+
+For TSCO (BRWKF0-R):
+2010-09-03: 0.5  (2:1 split)
+2013-09-27: 0.5  (another 2:1 split)
+2024-12-20: 0.2  (5:1 split)
+
+If these were properly combined/cumulative, we'd expect:
+- After 2024-12-20: 0.5 × 0.5 × 0.2 = 0.05 (to adjust prices before ALL splits)
+- After 2013-09-27: 0.5 × 0.5 = 0.25
+- After 2010-09-03: 0.5
+
+But instead each row shows the individual event factor, not the running product.
+
+Let me create a bug registration for this:
+
+● Write(sql/fds_stages/BUGS/BUG_001_fgp_ca_adj_factors_not_cumulative.md)
+⎿  Wrote 111 lines to sql/fds_stages/BUGS/BUG_001_fgp_ca_adj_factors_not_cumulative.md
+# BUG-001: fgp_ca_adj_factors Values Are Not Cumulative
+## Status: OPEN
+## Severity: HIGH
+## Created: 2026-01-12
+## Affects: FDS CA Pipeline - Factor Lookup
+---
+## Summary
+… +101 lines (ctrl+o to expand)
+
+● Bug registered. Let me also add this to the MCP's knowledge base so it's tracked in our pipeline context:
+
+● Bug registered: /sql/fds_stages/BUGS/BUG_001_fgp_ca_adj_factors_not_cumulative.md
+
+Decision: Continue using fgp_ca_events and calculate cumulative factors ourselves.
+
+Now let's verify our calculation matches FactSet's formula from Appendix A:
+
+-- FactSet's formula:
+EXP(SUM(LOG(price_adj_factor)))  -- Product of factors
+
+Let me check how our CA_LEVEL3 (cumulative factor) step calculates this:
+
+● Bash(cd /mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp && source .venv/bin/activate && python -c "
+from src import sql_content…)
+⎿  Uses FactSet formula: EXP(SUM(LOG(...)))
+Line 8: DECLARE @cumulative_factors_created INT = 0;
+Line 39: 2) CALCULATE CUMULATIVE FACTORS
+… +33 lines (ctrl+o to expand)
+⎿  Shell cwd was reset to /mnt/c/Users/dzalika/IdeaProjects/dptv2
+
+● Our CA_LEVEL3 uses EXP(SUM(LOG(...))) which matches FactSet's formula.
+
+The logic is:
+- cum_factor at date X = product of factor AT X and all LATER dates
+- Most recent event: cum = its own factor
+- Oldest event: cum = product of ALL factors
+
+This is correct for adjusting historical prices backwards.
+
+Now back to the original bug - the non-unique index issue. Let me look at the full sp_process_ca_level3 to understand the data flow:
+
+● Read(sql/fds_stages/step10_ca-level3-cumulative_procs.sql)
+⎿  Read 247 lines
+
+● This procedure looks clean - it does DELETE then INSERT, so duplicates in ca_cumulative_factors shouldn't be an issue.
+
+The unique index issue you mentioned earlier was in sp_process_price_derived → factset_prices_adjusted_derived with the constraint UNIQUE (tickerID, price_date).
+
+Let me trace the data flow to find where duplicates could enter:
+
+● Bash(cd /mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp && source .venv/bin/activate && python -c "
+from src import sql_content…)
+⎿  === #batch_tickers population ===
+SELECT DISTINCT
+q.tickerID,
+… +31 lines (ctrl+o to expand)
+⎿  Shell cwd was reset to /mnt/c/Users/dzalika/IdeaProjects/dptv2
+
+● Found the source of duplicates!
+
+The DISTINCT is on all columns, not just tickerID. So if:
+- Same tickerID has different queue_mode values, OR
+- Different start_date/end_date calculations for same tickerID
+
+→ Multiple rows per tickerID in #batch_tickers
+→ Multiple prices per (tickerID, price_date) when JOINed to prices
+→ Unique constraint violation
+
+Let me check the queue table to understand how this scenario occurs:
+
+● Read(sql/fds_stages/step01_tracking-infrastructure_tables.sql)
+⎿  Read 196 lines
+⎿  You've hit your limit · resets 8pm (America/New_York)
+Opening your options…
+
+
+
+
+
+
+
+
+
+
+
