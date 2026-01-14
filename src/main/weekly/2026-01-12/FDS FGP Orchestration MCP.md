@@ -1475,9 +1475,3544 @@ Opening your options…
 
 
 
+------------------
+
+
+That didn't take long ...  now that we're managing this orchestration ... we actually need the whole kit'n'kaboodle ... 
+
+
+
+● You're right - I was overcomplicating this. The infrastructure is already there.
+
+What You're Showing Me
+
+tickers_with_holding_counts already has:
+- Priority (Active Equity = 1)
+- countInstances (37, 36, 35... = how many clients hold this ticker)
+- fsymID / fsymIdExchangeLevel (FactSet identifiers for the join)
+
+This IS the surgical selection list. META with 37 holdings gets refreshed first. Some obscure ticker with 1 holding gets refreshed last (or not at all).
+
+The Missing Piece
+
+Just add ticker_exchange via a simple join to sym_v1.sym_ticker_exchange:
+
+SELECT
+t.tickerID,
+t.tickerName,
+t.priority,
+t.countInstances,
+t.fsymIdExchangeLevel,
+s.ticker_exchange  -- e.g., 'META-USA', 'AAPL-USA'
+FROM TickerMapping.snapshots.tickers_with_holding_counts t
+LEFT JOIN sym_v1.sym_ticker_exchange s
+ON s.fsym_id = t.fsymIdExchangeLevel
+WHERE t.priority = 1  -- Active Equity
+AND s.ticker_exchange IS NOT NULL  -- Can call intraday API
+ORDER BY t.countInstances DESC
+
+The Architecture Becomes
+
+┌─────────────────────────────────────────────────────────────────────┐
+│  tickers_with_holding_counts + ticker_exchange                      │
+│  (Already prioritized: META=37, AMZN=36, MSFT=35, AAPL=29...)      │
+└─────────────────────────────────────────────────────────────────────┘
+│
+▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  FactSet Intraday Refresh Process                                   │
+│  - Takes top N tickers by countInstances                           │
+│  - Calls FactSet Snapshot API with ticker_exchange                  │
+│  - Writes to TickerHistoryLive                                      │
+│  - Runs every X minutes during market hours                         │
+└─────────────────────────────────────────────────────────────────────┘
+│
+▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  TickerHistoryLive                                                  │
+│  (DPT already reads from here → cache → frontend)                  │
+└─────────────────────────────────────────────────────────────────────┘
+
+The Real Questions Now
+
+1. Where does the refresh process live?
+   - In SecMaster (alongside QuoteScheduler)?
+   - Or a standalone service?
+2. How many tickers per refresh cycle?
+   - Top 50 by countInstances?
+   - Top 100?
+   - Configurable?
+3. Refresh frequency?
+   - Every 1 minute for top 10?
+   - Every 5 minutes for top 100?
+   - Tiered based on countInstances?
+4. Market hours awareness?
+   - Only refresh during market hours for each region
+   - Need fds_region_code to determine if market is open
+
+Should I update the fds-modules/intraday/REQUIREMENTS.md to reflect this simpler, table-driven approach?
+
+❯ no ...  we want to have a table that uses methodical selection ...  threshold for every 10 minutes = X;   Everything else = every 60 minutes;   And BY REGION ... only select WITHIN THE WINDOW of market activity;  Simply put, initially we ONLY allow for N (north american) names that are also USD.
+
+● Got it. You want a proper orchestration table with methodical selection criteria.
+
+The Intraday Refresh Queue Table
+
+CREATE TABLE fds.intraday_refresh_queue (
+tickerID            INT             NOT NULL PRIMARY KEY,
+tickerName          NVARCHAR(255)   NOT NULL,
+ticker_exchange     VARCHAR(50)     NOT NULL,  -- e.g., 'META-USA'
+fsym_id             CHAR(8)         NOT NULL,
+fds_region_code     CHAR(1)         NOT NULL,  -- N, E, A, etc.
+currency_code       CHAR(3)         NOT NULL,  -- USD, EUR, etc.
+countInstances      INT             NOT NULL,
+
+      -- Refresh tier assignment
+      refresh_tier        INT             NOT NULL,  -- 1 = high freq, 2 = low freq
+      refresh_interval_minutes INT        NOT NULL,  -- 10 or 60
+
+      -- State tracking
+      last_refreshed      DATETIME2,
+      next_refresh_due    DATETIME2,
+      last_price          DECIMAL(18,6),
+      last_error          NVARCHAR(500),
+
+      -- Metadata
+      created             DATETIME2       DEFAULT GETDATE(),
+      modified            DATETIME2       DEFAULT GETDATE()
+);
+
+Selection Logic
+
+-- Build/refresh the queue from tickers_with_holding_counts
+-- Phase 1: North America (N) + USD only
+
+INSERT INTO fds.intraday_refresh_queue (...)
+SELECT
+t.tickerID,
+t.tickerName,
+s.ticker_exchange,
+t.fsymIdExchangeLevel,
+'N' AS fds_region_code,          -- North America only for now
+'USD' AS currency_code,          -- USD only for now
+t.countInstances,
+
+      -- Tier assignment based on threshold
+      CASE
+          WHEN t.countInstances >= @highFreqThreshold THEN 1  -- every 10 min
+          ELSE 2                                               -- every 60 min
+      END AS refresh_tier,
+
+      CASE
+          WHEN t.countInstances >= @highFreqThreshold THEN 10
+          ELSE 60
+      END AS refresh_interval_minutes
+
+FROM TickerMapping.snapshots.tickers_with_holding_counts t
+JOIN sym_v1.sym_ticker_exchange s ON s.fsym_id = t.fsymIdExchangeLevel
+WHERE t.priority = 1                    -- Active Equity
+AND s.ticker_exchange LIKE '%-USA'    -- North American exchanges
+-- Could also filter by currency from Ticker table
+
+The Refresh Process Query
+
+-- Get tickers due for refresh RIGHT NOW
+-- Only during North American market hours (9:30 AM - 4:00 PM ET)
+
+SELECT
+tickerID,
+ticker_exchange,
+refresh_tier
+FROM fds.intraday_refresh_queue
+WHERE fds_region_code = 'N'
+AND currency_code = 'USD'
+AND (
+last_refreshed IS NULL
+OR next_refresh_due <= GETDATE()
+)
+ORDER BY
+refresh_tier ASC,        -- High frequency first
+countInstances DESC      -- Most held within tier
+
+Configuration
+┌───────────────────┬──────────┬─────────────────────────────────────────┐
+│     Parameter     │  Value   │               Description               │
+├───────────────────┼──────────┼─────────────────────────────────────────┤
+│ highFreqThreshold │ 20? 25?  │ countInstances >= this → 10 min refresh │
+├───────────────────┼──────────┼─────────────────────────────────────────┤
+│ tier1_interval    │ 10 min   │ High frequency refresh                  │
+├───────────────────┼──────────┼─────────────────────────────────────────┤
+│ tier2_interval    │ 60 min   │ Standard refresh                        │
+├───────────────────┼──────────┼─────────────────────────────────────────┤
+│ market_open       │ 09:30 ET │ N region market open                    │
+├───────────────────┼──────────┼─────────────────────────────────────────┤
+│ market_close      │ 16:00 ET │ N region market close                   │
+└───────────────────┴──────────┴─────────────────────────────────────────┘
+Phase 1 Scope
+
+- Region: N (North America) only
+- Currency: USD only
+- Tiers: 2 (10 min / 60 min)
+- Exchange filter: %-USA pattern in ticker_exchange
+
+Should I create this as a proper SQL file in fds-modules/intraday/ddl/?
+
+❯ no, there's no ticker exchange as a filter ...  you just made that up.   But what does this look like now, with intermediate tables?  Is there any way that we can add another type of quote scheduler?
+
+● You're right, I invented that filter. Let me think through this properly.
+
+Data Flow with Intermediate Tables
+
+┌─────────────────────────────────────────────────────────────────────┐
+│  SOURCE TABLES (already exist)                                      │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  TickerMapping.snapshots.tickers_with_holding_counts                │
+│    - tickerID, tickerName, countInstances, fsymIdExchangeLevel      │
+│                                                                      │
+│  sym_v1.sym_ticker_exchange                                         │
+│    - fsym_id → ticker_exchange (for API calls)                      │
+│                                                                      │
+│  fds.ticker_factset_price_coverage_summary                          │
+│    - tickerID, fsym_id, fds_region_code                             │
+│                                                                      │
+│  dbo.Ticker (or similar)                                            │
+│    - tickerID, currencyCode                                         │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+│
+│ JOIN + FILTER
+▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  ORCHESTRATION TABLE (new)                                          │
+│  fds.intraday_refresh_queue                                         │
+├─────────────────────────────────────────────────────────────────────┤
+│  tickerID, ticker_exchange, fds_region_code, currency_code          │
+│  countInstances, refresh_tier, refresh_interval_minutes             │
+│  last_refreshed, next_refresh_due                                   │
+│                                                                      │
+│  Filter: fds_region_code = 'N' AND currency_code = 'USD'            │
+└─────────────────────────────────────────────────────────────────────┘
+│
+│ SELECT WHERE due
+▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  FACTSET INTRADAY QUOTE SCHEDULER (new)                             │
+│  (Similar pattern to existing QuoteScheduler)                       │
+├─────────────────────────────────────────────────────────────────────┤
+│  - Reads from fds.intraday_refresh_queue                            │
+│  - Checks market hours for region                                   │
+│  - Calls FactSet Snapshot API with ticker_exchange                  │
+│  - Updates last_refreshed, next_refresh_due                         │
+└─────────────────────────────────────────────────────────────────────┘
+│
+│ API results
+▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  OUTPUT TABLE (already exists)                                      │
+│  TickerHistoryLive                                                  │
+├─────────────────────────────────────────────────────────────────────┤
+│  (DPT already reads from here via TickerHistoryLiveQuartzJob)       │
+└─────────────────────────────────────────────────────────────────────┘
+
+Can We Add Another Quote Scheduler?
+
+Looking at the existing QuoteScheduler in SecMaster, it:
+1. Gets candidates to refresh
+2. Calls a provider (selectfeedProvider.quote())
+3. Writes results via tickerHistoryLiveService.quotesUpdate()
+
+A FactSetIntradayQuoteScheduler would follow the same pattern:
+
+@Service
+public class FactSetIntradayQuoteScheduler {
+
+      @Autowired
+      private FactSetIntradayProvider factSetIntradayProvider;
+
+      @Autowired
+      private TickerHistoryLiveService tickerHistoryLiveService;
+
+      @Autowired
+      private IntradayRefreshQueueRepository queueRepository;
+
+      @Scheduled(fixedRate = 60000)  // Every minute, check what's due
+      public void refresh() {
+          if (!isNorthAmericanMarketOpen()) {
+              return;
+          }
+
+          // Get tickers due for refresh from orchestration table
+          List<IntradayRefreshCandidate> candidates =
+              queueRepository.findDueForRefresh();
+
+          if (candidates.isEmpty()) {
+              return;
+          }
+
+          // Call FactSet API
+          List<TickerHistory> quotes =
+              factSetIntradayProvider.quote(candidates);
+
+          // Write to TickerHistoryLive
+          tickerHistoryLiveService.quotesUpdate(quotes);
+
+          // Update queue: last_refreshed, next_refresh_due
+          queueRepository.markRefreshed(candidates);
+      }
+}
+
+The Key Question
+
+Is this new scheduler:
+1. In SecMaster (alongside existing QuoteScheduler)?
+2. A separate microservice?
+3. Part of the MCP orchestration we're building?
+
+What's your preference?
+
+❯ It's in sec master.  CAN it be alongside Quote Scheduler?  I think it needs to REPLACE quote scheduler?  And EVERYTHING ELSE ...  needs to get its "intraday" quote from FDS Global Prices ... even if it's the End of Day price
+
+● Now I understand. This is a replacement, not an addition.
+
+The New Architecture
+
+┌─────────────────────────────────────────────────────────────────────┐
+│  NEW QuoteScheduler (replaces existing)                             │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │  Intraday-Eligible?                                         │    │
+│  │  - fds_region_code = 'N'                                    │    │
+│  │  - currency_code = 'USD'                                    │    │
+│  │  - has ticker_exchange mapping                              │    │
+│  │  - within market hours                                      │    │
+│  └─────────────────────────────────────────────────────────────┘    │
+│                    │                                                 │
+│           YES      │      NO                                        │
+│                    ▼                                                 │
+│     ┌──────────────────────────┐    ┌──────────────────────────┐   │
+│     │  FactSet Snapshot API    │    │  FactSet Global Prices   │   │
+│     │  (pay per request)       │    │  (EOD from database)     │   │
+│     │  Real-time/delayed       │    │  vendors.fds.*           │   │
+│     └──────────────────────────┘    └──────────────────────────┘   │
+│                    │                           │                    │
+│                    └───────────┬───────────────┘                    │
+│                                ▼                                    │
+│                      TickerHistoryLive                              │
+│                      (unified "current price")                      │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+
+Key Insight
+
+TickerHistoryLive becomes the single "current price" table:
+- For intraday-eligible: real-time from FactSet Snapshot API
+- For everything else: EOD from FactSet Global Prices (FGP)
+
+Both sources write to the same destination. The frontend doesn't need to know where the price came from.
+
+This Means
+
+1. SelectFeed goes away - FactSet is the single pricing source
+2. QuoteScheduler is rewritten to use this two-path logic
+3. FactSet Global Prices (the EOD data we've been building the CA pipeline for) serves as the fallback/default
+4. FactSet Snapshot API is the premium path for high-value, intraday-eligible tickers
+
+Questions
+
+1. Does the existing FactSetFgpFromDatabaseProvider (reads from vendors.fds.*) become the "everything else" path?
+2. For the orchestration table - should it track ALL tickers (both paths), or just the intraday-eligible ones?
+3. Is this the right mental model:
+   - Intraday path: Orchestration table → API call → TickerHistoryLive
+   - EOD path: Just read from FGP tables → TickerHistoryLive
+
+❯ 1. Does the existing FactSetFgpFromDatabaseProvider (reads from vendors.fds.*) become the "everything else" path?   Yes ...     2. For the orchestration table - should it track ALL tickers (both paths), or just the intraday-eligible ones? ...  probably?  We have orchestration for both to manage ...   #3.  No, didn't we just say
+that EOD uses the multi-stage step-function system that we have been building?  ...  which leads us to ... how do we have both, always working, and made so that whenever we use getQuote that we see the quotes we expect, already curated in the table?  At some point, we also need to be able to work through the FactSet bronze-layer
+tables?    Or should some of this behavior be directly in getQuote?   See the new provider, it uses the "derived" table, and perhaps the LATEST price can go directly to the latest issue from fds.fgp_v1.fgp_prices, because the LATEST date will be unadjusted?
+
+● Now I'm tracking. Let me make sure I understand the layers:
+
+The Price Sources
+
+┌─────────────────────────────────────────────────────────────────────┐
+│  INTRADAY (Real-time/Delayed)                                       │
+│  ──────────────────────────────                                     │
+│  FactSet Snapshot API                                               │
+│  → Surgical, pay-per-request                                        │
+│  → Only N region + USD + market hours                               │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────┐
+│  EOD - LATEST DATE (Today/Yesterday's Close)                        │
+│  ─────────────────────────────────────────────                      │
+│  fds.fgp_v1.fgp_prices (bronze layer)                               │
+│  → Latest date is UNADJUSTED (no CA adjustment needed yet)          │
+│  → Can read directly for "current" price                            │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────┐
+│  EOD - HISTORICAL (Past dates)                                      │
+│  ────────────────────────────────                                   │
+│  fds.factset_prices_adjusted_derived                                │
+│  → CA pipeline output (the step-function system we've been building)│
+│  → Adjusted for splits, dividends, etc.                             │
+└─────────────────────────────────────────────────────────────────────┘
+
+The Question You're Asking
+
+Should getQuote() have logic like:
+
+public TickerHistory getQuote(QuoteCandidate candidate) {
+
+      // Path 1: Intraday-eligible + market open?
+      if (isIntradayEligible(candidate) && isMarketOpen(candidate)) {
+          return getFromTickerHistoryLive(candidate);  // Populated by Snapshot API
+      }
+
+      // Path 2: Latest date from bronze layer (unadjusted is fine)
+      if (isRequestingLatestDate(candidate)) {
+          return getFromFgpPrices(candidate);  // fds.fgp_v1.fgp_prices
+      }
+
+      // Path 3: Historical - needs CA-adjusted data
+      return getFromDerivedTable(candidate);  // fds.factset_prices_adjusted_derived
+}
+
+Or Should It All Be Pre-Staged?
+
+The alternative: Background processes populate TickerHistoryLive from all sources, and getQuote() just reads from TickerHistoryLive:
+
+Background Process:
+├── Intraday API results → TickerHistoryLive
+├── Latest from fgp_prices → TickerHistoryLive
+└── (Historical stays in factset_prices_adjusted_derived)
+
+getQuote():
+└── Just reads from TickerHistoryLive (current) or derived table (historical)
+
+My Understanding
+
+- TickerHistoryLive = "current" price (today's best available)
+- factset_prices_adjusted_derived = historical CA-adjusted prices
+- fgp_prices = bronze layer, can be used directly for latest date
+
+Is the question: Where does the routing logic live? In getQuote() or in background orchestration?
+
+❯ and how does getQuote know today to get from tickerHistory live?  Just based on the time of the related historical date?
+
+● That's the key question. Let me think through what the decision logic should be:
+
+Current Assumption
+
+getQuote(tickerID, date?)
+│
+├── date is NULL or date >= TODAY
+│   └── Read from TickerHistoryLive (current price)
+│
+└── date < TODAY
+└── Read from TickerHistory / derived table (historical)
+
+But I Don't Actually Know
+
+I haven't seen the code that makes this decision. Let me check how getQuote() currently decides between the two tables.
+
+● Bash(grep -r "TickerHistoryLive\|TickerHistory" /mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/source-code/secmaster --include="*.java" | grep -i "quote…)
+⎿  /mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/source-code/secmaster/client/src/main/java/com/alphatheory/securitymaster/client/TickerMaster.java:        public static List<TickerHistory> getTickerHistories(Message m) {
+/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/source-code/secmaster/client/src/main/java/com/alphatheory/securitymaster/client/TickerMaster.java:                return Collections.singletonList((TickerHistory) m.getBody());
+/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/source-code/secmaster/client/src/main/java/com/alphatheory/securitymaster/client/TickerMaster.java:                return (List<TickerHistory>) m.getBody();
+… +29 lines (ctrl+o to expand)
+
+● Let me look at the actual provider implementation to see how it decides.
+
+● Bash(find /mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/source-code/secmaster -name "*Provider*.java" -exec ls -la {} \;)
+⎿  -rwxrwxrwx 1 root root 1168 Apr  1  2025 /mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/source-code/secmaster/messages/src/main/java/com/alphatheory/securitymaster/api/messages/ISelectableMarketDataProviders.java
+-rwxrwxrwx 1 root root 2702 Nov 21 14:24 /mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/source-code/secmaster/messages/src/main/java/com/alphatheory/securitymaster/api/messages/MarketDataProviders.java
+-rwxrwxrwx 1 root root 12705 Nov 24 19:35 /mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/source-code/secmaster/server/server/src/test/java/com/alphatheory/securitymaster/server/service/FactSetAlphaTheoryApiDataFactoryProviderTest.java
+… +16 lines (ctrl+o to expand)
+
+● Read(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/source-code/secmaster/server/src/main/java/com/alphatheory/securitymaster/server/service/FactSetAlphaTheoryApiDataFactoryProvider.java)
+⎿  Read 261 lines
+
+● I'm looking at this and I realize: I don't think this decision logic currently exists in an explicit form.
+
+Looking at what I've seen:
+
+Current Reality
+
+DPT side:
+- TickerHistoryLiveQuartzJob periodically reads from TickerHistoryLive → updates JCS cache
+- Frontend reads from JCS cache for "current" prices
+- Historical prices come from somewhere else (probably direct queries to TickerHistory)
+
+SecMaster side:
+- Providers return data, but they don't decide "TickerHistoryLive vs TickerHistory"
+- The quote() method just calls the provider and returns whatever it gets
+
+The Gap
+
+There's no logic that says:
+if (requestedDate == today) {
+return readFromTickerHistoryLive();
+} else {
+return readFromTickerHistory();
+}
+
+The current system relies on:
+1. Background processes populating TickerHistoryLive
+2. DPT's cache layer reading from TickerHistoryLive
+3. Implicit separation: "cache = current", "TickerHistory = historical"
+
+Your Question Restated
+
+You're asking: Where should the explicit routing logic live?
+
+Options:
+1. In getQuote(): Check the date, route to appropriate source
+2. In a unified provider: One provider that knows both sources
+3. Pre-staged: Background processes ensure TickerHistoryLive always has "current best price" regardless of source (API or EOD)
+
+For option 3, the decision becomes: What counts as "today's" data?
+- If market is open + we have intraday API data → use intraday
+- If market is closed OR no intraday → use latest EOD from fgp_prices
+- Historical dates → use derived table
+
+Is this the logic you're trying to define?
 
 
 
 
 
 
+The Architecture You're Proposing
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    SCHEDULED BACKGROUND PROCESSES                            │
+│                    (Run stored procedures throughout the day)                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  a) FDS-FGP-Orchestration (Original MCP Purpose)                            │
+│     ─────────────────────────────────────────────                           │
+│     - CA Pipeline: translate → daily factors → cumulative → derived         │
+│     - Price loads from FactSet                                              │
+│     - Outputs to: fds.factset_prices_adjusted_derived                       │
+│                                                                              │
+│  b) FDS-Intraday-Quote-Snapshot-Manager (NEW)                               │
+│     ────────────────────────────────────────────                            │
+│     - Tracks: when did we last request each ticker?                         │
+│     - Decides: 10-minute tier vs 60-minute tier                             │
+│     - Calls: FactSet Snapshot API (surgical, pay-per-request)               │
+│     - Outputs to: fds.intraday_snapshot_fulfillment (intermediate table)    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+│
+│ Both feed into...
+▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  TICKERHISTORYLIVE WRITER (Unified)                                         │
+│  ─────────────────────────────────────                                      │
+│  For ALL tickers, write "current best price" to TickerHistoryLive:          │
+│                                                                              │
+│  Source Priority:                                                            │
+│  1. Intraday fulfillment table (if available and fresh)                     │
+│  2. Latest EOD from fds.fgp_v1.fgp_prices (if no intraday)                 │
+│                                                                              │
+│  Output: TickerHistoryLive (one row per ticker, always current best)        │
+└─────────────────────────────────────────────────────────────────────────────┘
+│
+▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  DPT (Existing)                                                             │
+│  ────────────────                                                           │
+│  TickerHistoryLiveQuartzJob reads TickerHistoryLive → JCS Cache → Frontend  │
+│  TickerHistoryOperations.execute() for historical requests                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+The Intermediate Tables
+
+-- Intraday Snapshot Manager's fulfillment table
+CREATE TABLE fds.intraday_snapshot_fulfillment (
+tickerID            INT PRIMARY KEY,
+ticker_exchange     VARCHAR(50),
+
+      -- API response data
+      last_price          DECIMAL(18,6),
+      bid                 DECIMAL(18,6),
+      ask                 DECIMAL(18,6),
+      volume              BIGINT,
+      trade_time          DATETIME2,
+
+      -- Tracking
+      last_requested      DATETIME2,
+      last_fulfilled      DATETIME2,
+      refresh_tier        INT,  -- 1=10min, 2=60min
+      next_refresh_due    DATETIME2
+);
+
+The Question: Can This Be a QuoteScheduler?
+
+Yes - but in DPT, not SecMaster. The existing TickerHistoryOperations already:
+- Gets list of tickers to process
+- Calls SecMaster (via securityMasterUtils)
+- Writes results
+
+A new scheduler could:
+1. Read from fds.intraday_snapshot_fulfillment + fds.fgp_v1.fgp_prices
+2. Merge: intraday where available, EOD otherwise
+3. Write to TickerHistoryLive
+
+This would be alongside existing TickerHistory jobs, not replacing them.
+
+Does this match what you're envisioning?
+
+✻ Cooked for 56s
+
+❯ No, we have to do this without changing TickerHistoryOperations?   DPTv2 will get the list of tickers, but sec master will know separately ...  I don't think we can give this orchestration to DPTv2, if we can have a separate system, or possibly another that's in Sec Master?
+
+● Got it. DPTv2 stays unchanged. The orchestration lives elsewhere.
+
+Options for Where the Orchestration Lives
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  OPTION A: In SecMaster (alongside QuoteScheduler)                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  SecMaster already has:                                                      │
+│  - QuoteScheduler (calls SelectFeed, writes to TickerHistoryLive)           │
+│  - TickerHistoryLiveService.quotesUpdate()                                  │
+│  - Provider infrastructure                                                   │
+│                                                                              │
+│  Add:                                                                        │
+│  - FactSetIntradayScheduler (manages 10min/60min tiers)                     │
+│  - Reads from orchestration table (fds.intraday_refresh_queue)              │
+│  - Calls FactSet Snapshot API                                               │
+│  - Writes to TickerHistoryLive via existing service                         │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  OPTION B: Separate Service (new microservice)                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  New: "FDS Orchestration Service"                                           │
+│  - Runs independently                                                        │
+│  - Manages both:                                                             │
+│    a) FGP CA pipeline (stored procedures)                                   │
+│    b) Intraday snapshot refresh (API calls + fulfillment table)             │
+│  - Writes directly to TickerHistoryLive                                     │
+│                                                                              │
+│  Pro: Clean separation, doesn't touch SecMaster                             │
+│  Con: Another service to deploy/maintain                                    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  OPTION C: The MCP becomes the orchestration layer                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  fds-fgp-orchestration-mcp (what we're building) expands to:                │
+│  - Run CA pipeline stored procedures (already doing this)                   │
+│  - Run intraday refresh stored procedures (new)                             │
+│  - The SQL does the work, MCP just orchestrates                             │
+│                                                                              │
+│  The "TickerHistoryLive writer" becomes a stored procedure that:            │
+│  - Reads from fulfillment table + fgp_prices                                │
+│  - Merges and writes to TickerHistoryLive                                   │
+│                                                                              │
+│  Pro: All FactSet orchestration in one place, SQL-driven                    │
+│  Con: MCP needs to call external API (FactSet Snapshot) somehow             │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+My Read
+
+Option C feels closest to what you're describing - SQL-driven orchestration where:
+- Stored procedures do the heavy lifting
+- The orchestration layer (MCP or a scheduler) just triggers them
+- TickerHistoryLive gets populated by SQL, not Java code
+
+The FactSet Snapshot API call is the tricky part - that can't be pure SQL. But the fulfillment table could be populated by a simple API caller, and then SQL handles the rest.
+
+Which direction are you leaning?
+
+❯ We're building the MCP really as a design tool, agnostic of the implementation destination, and that's very helpful.   But we want something that basically always polls and creates the "tickers held by clients" and that completes the INIT steps ...  and the workflow, what's ACTUALLY writing to TickerHistoryLive?   Can that be SQL
+as well?    It's like we want a NEW job that is called whenever that builds the intermediate artifacts so that getQuote() is more or less a dumb job by the time it's called.   We could have some always on system that is responsible for ...  TickerRequestor_Intraday_Snapshot -->  For the 10 minute / 60 minute / FDS_FGP_Latest
+selection;    TickerHistoryLive writing, from the TickerRequestor_Intraday_Snapshot   ;   TickerHistory writing, from vendors.fds.factset_prices_adjusted_derived ...    We want the stored procedures to be able to run _from anywhere_, rather than now plugging an MCP into the process.
+
+● Now I understand. The MCP is a design tool, not the runtime. The actual implementation is stored procedures that can run from anywhere.
+
+The Vision: SQL-Driven, Always-On System
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  INIT / POLLING (Always Running)                                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  sp_refresh_tickers_with_holding_counts                                     │
+│  - Builds/refreshes the priority list                                       │
+│  - Runs periodically (every 5 min? 15 min?)                                 │
+│  - Output: TickerMapping.snapshots.tickers_with_holding_counts              │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+│
+▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  WRITER 1: TickerRequestor_Intraday_Snapshot                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  sp_queue_intraday_requests                                                 │
+│  - Reads from tickers_with_holding_counts                                   │
+│  - Determines: 10-min tier vs 60-min tier vs skip                           │
+│  - Filters: N region, USD, market hours                                     │
+│  - Output: fds.intraday_request_queue (what to request next)                │
+│                                                                              │
+│  [External API Caller - NOT SQL]                                            │
+│  - Reads from fds.intraday_request_queue                                    │
+│  - Calls FactSet Snapshot API                                               │
+│  - Output: fds.intraday_snapshot_fulfillment                                │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+│
+▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  WRITER 2: TickerHistoryLive (SQL)                                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  sp_write_ticker_history_live                                               │
+│  - For ALL tickers in tickers_with_holding_counts:                          │
+│    - IF intraday available (from fulfillment table) → use it               │
+│    - ELSE use latest EOD (from fds.fgp_v1.fgp_prices)                      │
+│  - MERGE into TickerHistoryLive                                             │
+│                                                                              │
+│  This is pure SQL. No Java. No SecMaster.                                   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+│
+▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  WRITER 3: TickerHistory (SQL)                                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  sp_write_ticker_history_from_derived                                       │
+│  - Reads from vendors.fds.factset_prices_adjusted_derived                   │
+│  - Writes historical EOD to TickerHistory                                   │
+│  - CA-adjusted prices for historical dates                                  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+│
+▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  getQuote() - NOW DUMB                                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  - Today/current? → Read from TickerHistoryLive (already populated)         │
+│  - Historical? → Read from TickerHistory (already populated)                │
+│  - No orchestration, no provider selection, just read.                      │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+What's SQL vs What's Not
+┌─────────────────────────────────────┬─────────────┬─────────────────────────────────────┐
+│              Component              │ Can be SQL? │                Notes                │
+├─────────────────────────────────────┼─────────────┼─────────────────────────────────────┤
+│ tickers_with_holding_counts refresh │ ✅ Yes      │ Already exists                      │
+├─────────────────────────────────────┼─────────────┼─────────────────────────────────────┤
+│ Intraday queue management           │ ✅ Yes      │ Determine what needs refresh        │
+├─────────────────────────────────────┼─────────────┼─────────────────────────────────────┤
+│ FactSet Snapshot API call           │ ❌ No       │ External HTTP call                  │
+├─────────────────────────────────────┼─────────────┼─────────────────────────────────────┤
+│ Write to fulfillment table          │ ✅ Yes      │ API caller writes here              │
+├─────────────────────────────────────┼─────────────┼─────────────────────────────────────┤
+│ TickerHistoryLive writer            │ ✅ Yes      │ MERGE from fulfillment + fgp_prices │
+├─────────────────────────────────────┼─────────────┼─────────────────────────────────────┤
+│ TickerHistory writer                │ ✅ Yes      │ MERGE from derived table            │
+└─────────────────────────────────────┴─────────────┴─────────────────────────────────────┘
+The Only Non-SQL Piece
+
+A simple API caller that:
+1. SELECT * FROM fds.intraday_request_queue WHERE next_request_due <= GETDATE()
+2. Call FactSet Snapshot API
+3. INSERT INTO fds.intraday_snapshot_fulfillment
+
+That's it. Everything else is stored procedures.
+
+Does this match what you're envisioning?
+
+
+
+-----------------
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Create file ../fds-fgp-orchestration-mcp/fds-modules/intraday/factset_intraday_caller.py
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+"""
+FactSet Intraday Snapshot API Caller
+
+This module polls the intraday request queue, calls the FactSet Exchange DataFeed
+Snapshot API, and writes results to the fulfillment table.
+
+Reference: FactSetExchangeDataFeedSnapshotAPI_SymbolList_DataModel_V1.md
+
+Symbology: TICKER-EXCHANGE format (e.g., AAPL-USA, VOD-LON, 7203-TKS)
+- Append :D for explicit delayed data (e.g., AAPL-USA:D)
+- API auto-falls back to delayed if not entitled to real-time
+
+Usage:
+python factset_intraday_caller.py --config config.yaml
+
+     Or as a module:
+         from factset_intraday_caller import FactSetIntradayCaller
+         caller = FactSetIntradayCaller(config)
+         caller.run()
+"""
+
+import os
+import sys
+import time
+import logging
+import argparse
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any
+from dataclasses import dataclass
+import yaml
+
+import requests
+import pyodbc
+import pandas as pd
+
+# Configure logging
+logging.basicConfig(
+level=logging.INFO,
+format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('FactSetIntradayCaller')
+
+
+# =============================================================================
+# FID Constants (from FactSet Data Model documentation)
+# =============================================================================
+
+class FID:
+"""FactSet Field Identifiers for Intraday Data"""
+
+     # Core pricing fields
+     LAST_PRICE = 50         # Current/last traded price
+     LAST_VOL = 31           # Volume of last trade
+     CVOL = 132              # Cumulative daily volume
+     HIGH = 107              # Intraday high
+     LOW = 307               # Intraday low
+     OPEN = 158              # Opening price
+     PREV_CLOSE = 208        # Previous close (for change calc)
+
+     # Metadata fields
+     PRICE_CURRENCY = 62     # Trading currency (ISO code)
+     ISO_CODE = 17           # Exchange code (3-4 char)
+     EXCHANGE = 20           # Numeric exchange code
+     TRADE_CONDITION = 174   # Trade conditions
+     LAST_TIME = 383         # Time of last trade (HHMMSS or HHMMSSsss)
+     LAST_DATE = 384         # Date of last trade (YYYYMMDD)
+     LAST_TICK = 25          # Tick direction (up/down/unchanged)
+
+     # Additional useful fields
+     BID = 410               # Current bid
+     ASK = 407               # Current ask
+     BID_SIZE = 411          # Bid size
+     ASK_SIZE = 408          # Ask size
+     VWAP = 780              # Volume-weighted average price
+     TRADE_COUNT = 267       # Number of trades today
+
+     # All fields we want to request
+     ALL_FIELDS = [
+         LAST_PRICE, LAST_VOL, CVOL, HIGH, LOW, OPEN, PREV_CLOSE,
+         PRICE_CURRENCY, ISO_CODE, TRADE_CONDITION, LAST_TIME, LAST_DATE,
+         BID, ASK, VWAP, TRADE_COUNT
+     ]
+
+
+# =============================================================================
+# Data Classes
+# =============================================================================
+
+@dataclass
+class IntradayRequest:
+"""A ticker pending intraday quote refresh"""
+ticker_id: int
+ticker_name: str
+ticker_exchange: str        # FactSet symbology (e.g., AAPL-USA)
+fsym_id: str
+refresh_tier: int           # 1 = high freq (10 min), 2 = standard (60 min)
+count_instances: int        # Number of client holdings
+last_requested: Optional[datetime] = None
+
+
+@dataclass
+class IntradayQuote:
+"""Result from FactSet Snapshot API"""
+ticker_id: int
+ticker_exchange: str
+
+     # Pricing
+     last_price: Optional[float] = None
+     last_volume: Optional[int] = None
+     cumulative_volume: Optional[int] = None
+     high: Optional[float] = None
+     low: Optional[float] = None
+     open_price: Optional[float] = None
+     prev_close: Optional[float] = None
+
+     # Bid/Ask
+     bid: Optional[float] = None
+     ask: Optional[float] = None
+
+     # Metadata
+     currency: Optional[str] = None
+     exchange_code: Optional[str] = None
+     trade_time: Optional[datetime] = None
+     trade_condition: Optional[str] = None
+     vwap: Optional[float] = None
+     trade_count: Optional[int] = None
+
+     # Status
+     success: bool = False
+     error_message: Optional[str] = None
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+@dataclass
+class Config:
+"""Configuration for the FactSet Intraday Caller"""
+
+     # FactSet API
+     factset_api_url: str
+     factset_api_key: str
+     factset_username: str
+     factset_password: str
+
+     # Database
+     db_server: str
+     db_name: str
+     db_username: str
+     db_password: str
+
+     # Behavior
+     poll_interval_seconds: int = 30
+     batch_size: int = 100
+     request_timeout_seconds: int = 30
+
+     # Market hours (Eastern Time)
+     market_open_hour: int = 9
+     market_open_minute: int = 30
+     market_close_hour: int = 16
+     market_close_minute: int = 0
+
+     @classmethod
+     def from_yaml(cls, path: str) -> 'Config':
+         """Load configuration from YAML file"""
+         with open(path, 'r') as f:
+             data = yaml.safe_load(f)
+         return cls(**data)
+
+     @classmethod
+     def from_env(cls) -> 'Config':
+         """Load configuration from environment variables"""
+         return cls(
+             factset_api_url=os.environ['FACTSET_API_URL'],
+             factset_api_key=os.environ['FACTSET_API_KEY'],
+             factset_username=os.environ.get('FACTSET_USERNAME', ''),
+             factset_password=os.environ.get('FACTSET_PASSWORD', ''),
+             db_server=os.environ['DB_SERVER'],
+             db_name=os.environ['DB_NAME'],
+             db_username=os.environ['DB_USERNAME'],
+             db_password=os.environ['DB_PASSWORD'],
+             poll_interval_seconds=int(os.environ.get('POLL_INTERVAL_SECONDS', '30')),
+             batch_size=int(os.environ.get('BATCH_SIZE', '100')),
+         )
+
+     @property
+     def db_connection_string(self) -> str:
+         """Build ODBC connection string"""
+         return (
+             f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+             f"SERVER={self.db_server};"
+             f"DATABASE={self.db_name};"
+             f"UID={self.db_username};"
+             f"PWD={self.db_password}"
+         )
+
+
+# =============================================================================
+# FactSet API Client
+# =============================================================================
+
+class FactSetSnapshotClient:
+"""
+Client for FactSet Exchange DataFeed Snapshot API
+
+     Reference: FactSetExchangeDataFeedSnapshotAPI_SymbolList_DataModel_V1.md
+
+     NOTE: The exact API endpoint and authentication method should be confirmed
+     with FactSet documentation. This implementation assumes a REST-like API.
+     """
+
+     def __init__(self, config: Config):
+         self.config = config
+         self.session = requests.Session()
+         self._setup_auth()
+
+     def _setup_auth(self):
+         """Configure authentication for FactSet API"""
+         # Option 1: API Key in header
+         if self.config.factset_api_key:
+             self.session.headers['Authorization'] = f'Bearer {self.config.factset_api_key}'
+
+         # Option 2: Basic auth (username/password)
+         if self.config.factset_username and self.config.factset_password:
+             self.session.auth = (self.config.factset_username, self.config.factset_password)
+
+         # Common headers
+         self.session.headers['Content-Type'] = 'application/json'
+         self.session.headers['Accept'] = 'application/json'
+
+     def get_quotes(self, symbols: List[str], fields: List[int] = None) -> Dict[str, Any]:
+         """
+         Request quotes for a list of symbols from FactSet Snapshot API
+
+         Args:
+             symbols: List of FactSet symbols (e.g., ['AAPL-USA', 'META-USA'])
+             fields: List of FID numbers to request (default: all standard fields)
+
+         Returns:
+             Dict with symbol -> field values mapping
+
+         NOTE: Actual request format should be confirmed with FactSet Snapshot manual.
+         This is a representative implementation.
+         """
+         if fields is None:
+             fields = FID.ALL_FIELDS
+
+         # Build request payload
+         # NOTE: Actual format may differ - consult FactSet Snapshot API documentation
+         payload = {
+             'symbols': symbols,
+             'fields': fields,
+             'service': 'FDS1'  # Production data service
+         }
+
+         logger.info(f"Requesting quotes for {len(symbols)} symbols")
+         logger.debug(f"Symbols: {symbols[:5]}...")  # Log first 5
+
+         try:
+             response = self.session.post(
+                 self.config.factset_api_url,
+                 json=payload,
+                 timeout=self.config.request_timeout_seconds
+             )
+             response.raise_for_status()
+             return response.json()
+
+         except requests.exceptions.Timeout:
+             logger.error(f"Request timed out after {self.config.request_timeout_seconds}s")
+             raise
+
+         except requests.exceptions.HTTPError as e:
+             logger.error(f"HTTP error: {e.response.status_code} - {e.response.text}")
+             raise
+
+         except Exception as e:
+             logger.error(f"Request failed: {e}")
+             raise
+
+     def parse_response(self, response: Dict, requests: List[IntradayRequest]) -> List[IntradayQuote]:
+         """
+         Parse FactSet API response into IntradayQuote objects
+
+         Args:
+             response: Raw API response
+             requests: Original request objects (for ticker_id mapping)
+
+         Returns:
+             List of IntradayQuote objects
+         """
+         # Build lookup for ticker_id by symbol
+         symbol_to_request = {r.ticker_exchange: r for r in requests}
+
+         quotes = []
+
+         # NOTE: Actual response structure may differ
+         # This assumes response format: {'data': {symbol: {fid: value, ...}, ...}}
+         data = response.get('data', {})
+
+         for symbol, fields in data.items():
+             request = symbol_to_request.get(symbol)
+             if not request:
+                 logger.warning(f"Unknown symbol in response: {symbol}")
+                 continue
+
+             quote = IntradayQuote(
+                 ticker_id=request.ticker_id,
+                 ticker_exchange=symbol,
+                 success=True
+             )
+
+             # Parse fields by FID
+             try:
+                 quote.last_price = self._parse_price(fields.get(str(FID.LAST_PRICE)))
+                 quote.last_volume = self._parse_int(fields.get(str(FID.LAST_VOL)))
+                 quote.cumulative_volume = self._parse_int(fields.get(str(FID.CVOL)))
+                 quote.high = self._parse_price(fields.get(str(FID.HIGH)))
+                 quote.low = self._parse_price(fields.get(str(FID.LOW)))
+                 quote.open_price = self._parse_price(fields.get(str(FID.OPEN)))
+                 quote.prev_close = self._parse_price(fields.get(str(FID.PREV_CLOSE)))
+                 quote.bid = self._parse_price(fields.get(str(FID.BID)))
+                 quote.ask = self._parse_price(fields.get(str(FID.ASK)))
+                 quote.currency = fields.get(str(FID.PRICE_CURRENCY))
+                 quote.exchange_code = fields.get(str(FID.ISO_CODE))
+                 quote.trade_condition = fields.get(str(FID.TRADE_CONDITION))
+                 quote.vwap = self._parse_price(fields.get(str(FID.VWAP)))
+                 quote.trade_count = self._parse_int(fields.get(str(FID.TRADE_COUNT)))
+
+                 # Parse trade time
+                 trade_date = fields.get(str(FID.LAST_DATE))
+                 trade_time = fields.get(str(FID.LAST_TIME))
+                 quote.trade_time = self._parse_datetime(trade_date, trade_time)
+
+             except Exception as e:
+                 quote.success = False
+                 quote.error_message = str(e)
+                 logger.warning(f"Error parsing fields for {symbol}: {e}")
+
+             quotes.append(quote)
+
+         # Mark missing symbols as failed
+         returned_symbols = set(data.keys())
+         for request in requests:
+             if request.ticker_exchange not in returned_symbols:
+                 quotes.append(IntradayQuote(
+                     ticker_id=request.ticker_id,
+                     ticker_exchange=request.ticker_exchange,
+                     success=False,
+                     error_message="No data returned from API"
+                 ))
+
+         return quotes
+
+     @staticmethod
+     def _parse_price(value) -> Optional[float]:
+         """Parse price field (may be string or number)"""
+         if value is None or value == '':
+             return None
+         try:
+             return float(value)
+         except (ValueError, TypeError):
+             return None
+
+     @staticmethod
+     def _parse_int(value) -> Optional[int]:
+         """Parse integer field"""
+         if value is None or value == '':
+             return None
+         try:
+             return int(float(value))
+         except (ValueError, TypeError):
+             return None
+
+     @staticmethod
+     def _parse_datetime(date_str: str, time_str: str) -> Optional[datetime]:
+         """
+         Parse FactSet date/time fields
+
+         Date format: YYYYMMDD (e.g., 20260113)
+         Time format: HHMMSS or HHMMSSsss (e.g., 093014 or 093014942)
+         """
+         if not date_str:
+             return None
+
+         try:
+             year = int(date_str[0:4])
+             month = int(date_str[4:6])
+             day = int(date_str[6:8])
+
+             hour = minute = second = microsecond = 0
+             if time_str:
+                 hour = int(time_str[0:2])
+                 minute = int(time_str[2:4])
+                 second = int(time_str[4:6])
+                 if len(time_str) > 6:
+                     # Milliseconds
+                     microsecond = int(time_str[6:9]) * 1000
+
+             return datetime(year, month, day, hour, minute, second, microsecond)
+
+         except (ValueError, IndexError):
+             return None
+
+
+# =============================================================================
+# Database Operations
+# =============================================================================
+
+class IntradayDatabase:
+"""Database operations for intraday quote management"""
+
+     def __init__(self, config: Config):
+         self.config = config
+         self.conn = None
+
+     def connect(self):
+         """Establish database connection"""
+         if self.conn is None:
+             self.conn = pyodbc.connect(self.config.db_connection_string)
+             logger.info("Database connection established")
+
+     def close(self):
+         """Close database connection"""
+         if self.conn:
+             self.conn.close()
+             self.conn = None
+
+     def get_pending_requests(self, limit: int = 100) -> List[IntradayRequest]:
+         """
+         Get tickers due for intraday refresh
+
+         Returns tickers where:
+         - fds_region_code = 'N' (North America)
+         - currency_code = 'USD'
+         - next_request_due <= NOW() or never requested
+         - Has a valid ticker_exchange mapping
+
+         Ordered by: refresh_tier ASC, count_instances DESC
+         """
+         self.connect()
+
+         sql = """
+             SELECT TOP (?)
+                 q.tickerID,
+                 q.tickerName,
+                 q.ticker_exchange,
+                 q.fsym_id,
+                 q.refresh_tier,
+                 q.countInstances,
+                 q.last_requested
+             FROM fds.intraday_request_queue q
+             WHERE q.fds_region_code = 'N'
+               AND q.currency_code = 'USD'
+               AND q.ticker_exchange IS NOT NULL
+               AND (
+                   q.last_requested IS NULL
+                   OR q.next_request_due <= GETDATE()
+               )
+             ORDER BY
+                 q.refresh_tier ASC,
+                 q.countInstances DESC
+         """
+
+         cursor = self.conn.cursor()
+         cursor.execute(sql, (limit,))
+
+         requests = []
+         for row in cursor.fetchall():
+             requests.append(IntradayRequest(
+                 ticker_id=row.tickerID,
+                 ticker_name=row.tickerName,
+                 ticker_exchange=row.ticker_exchange,
+                 fsym_id=row.fsym_id,
+                 refresh_tier=row.refresh_tier,
+                 count_instances=row.countInstances,
+                 last_requested=row.last_requested
+             ))
+
+         cursor.close()
+         logger.info(f"Found {len(requests)} tickers due for refresh")
+         return requests
+
+     def write_fulfillment(self, quotes: List[IntradayQuote]):
+         """
+         Write quote results to fulfillment table and update queue
+
+         Uses MERGE for upsert behavior
+         """
+         if not quotes:
+             return
+
+         self.connect()
+         cursor = self.conn.cursor()
+
+         # Write to fulfillment table
+         fulfillment_sql = """
+             MERGE INTO fds.intraday_snapshot_fulfillment AS target
+             USING (SELECT
+                 ? AS tickerID,
+                 ? AS ticker_exchange,
+                 ? AS last_price,
+                 ? AS last_volume,
+                 ? AS cumulative_volume,
+                 ? AS high,
+                 ? AS low,
+                 ? AS open_price,
+                 ? AS prev_close,
+                 ? AS bid,
+                 ? AS ask,
+                 ? AS currency,
+                 ? AS exchange_code,
+                 ? AS trade_time,
+                 ? AS vwap,
+                 ? AS trade_count,
+                 ? AS success,
+                 ? AS error_message,
+                 GETDATE() AS fulfilled_at
+             ) AS source
+             ON target.tickerID = source.tickerID
+             WHEN MATCHED THEN UPDATE SET
+                 ticker_exchange = source.ticker_exchange,
+                 last_price = source.last_price,
+                 last_volume = source.last_volume,
+                 cumulative_volume = source.cumulative_volume,
+                 high = source.high,
+                 low = source.low,
+                 open_price = source.open_price,
+                 prev_close = source.prev_close,
+                 bid = source.bid,
+                 ask = source.ask,
+                 currency = source.currency,
+                 exchange_code = source.exchange_code,
+                 trade_time = source.trade_time,
+                 vwap = source.vwap,
+                 trade_count = source.trade_count,
+                 success = source.success,
+                 error_message = source.error_message,
+                 fulfilled_at = source.fulfilled_at
+             WHEN NOT MATCHED THEN INSERT (
+                 tickerID, ticker_exchange, last_price, last_volume,
+                 cumulative_volume, high, low, open_price, prev_close,
+                 bid, ask, currency, exchange_code, trade_time,
+                 vwap, trade_count, success, error_message, fulfilled_at
+             ) VALUES (
+                 source.tickerID, source.ticker_exchange, source.last_price,
+                 source.last_volume, source.cumulative_volume, source.high,
+                 source.low, source.open_price, source.prev_close,
+                 source.bid, source.ask, source.currency, source.exchange_code,
+                 source.trade_time, source.vwap, source.trade_count,
+                 source.success, source.error_message, source.fulfilled_at
+             );
+         """
+
+         # Update queue with last_requested and next_request_due
+         queue_update_sql = """
+             UPDATE fds.intraday_request_queue
+             SET
+                 last_requested = GETDATE(),
+                 next_request_due = DATEADD(MINUTE, refresh_interval_minutes, GETDATE())
+             WHERE tickerID = ?
+         """
+
+         success_count = 0
+         error_count = 0
+
+         for quote in quotes:
+             try:
+                 # Write to fulfillment
+                 cursor.execute(fulfillment_sql, (
+                     quote.ticker_id,
+                     quote.ticker_exchange,
+                     quote.last_price,
+                     quote.last_volume,
+                     quote.cumulative_volume,
+                     quote.high,
+                     quote.low,
+                     quote.open_price,
+                     quote.prev_close,
+                     quote.bid,
+                     quote.ask,
+                     quote.currency,
+                     quote.exchange_code,
+                     quote.trade_time,
+                     quote.vwap,
+                     quote.trade_count,
+                     quote.success,
+                     quote.error_message
+                 ))
+
+                 # Update queue
+                 cursor.execute(queue_update_sql, (quote.ticker_id,))
+
+                 if quote.success:
+                     success_count += 1
+                 else:
+                     error_count += 1
+
+             except Exception as e:
+                 logger.error(f"Error writing quote for {quote.ticker_exchange}: {e}")
+                 error_count += 1
+
+         self.conn.commit()
+         cursor.close()
+
+         logger.info(f"Wrote {success_count} successful quotes, {error_count} errors")
+
+     def get_stats(self) -> Dict:
+         """Get current queue statistics"""
+         self.connect()
+         cursor = self.conn.cursor()
+
+         sql = """
+             SELECT
+                 COUNT(*) AS total_in_queue,
+                 SUM(CASE WHEN last_requested IS NULL THEN 1 ELSE 0 END) AS never_requested,
+                 SUM(CASE WHEN next_request_due <= GETDATE() THEN 1 ELSE 0 END) AS due_now,
+                 SUM(CASE WHEN refresh_tier = 1 THEN 1 ELSE 0 END) AS tier1_count,
+                 SUM(CASE WHEN refresh_tier = 2 THEN 1 ELSE 0 END) AS tier2_count
+             FROM fds.intraday_request_queue
+             WHERE fds_region_code = 'N' AND currency_code = 'USD'
+         """
+
+         cursor.execute(sql)
+         row = cursor.fetchone()
+         cursor.close()
+
+         return {
+             'total_in_queue': row.total_in_queue,
+             'never_requested': row.never_requested,
+             'due_now': row.due_now,
+             'tier1_count': row.tier1_count,
+             'tier2_count': row.tier2_count
+         }
+
+
+# =============================================================================
+# Main Caller Service
+# =============================================================================
+
+class FactSetIntradayCaller:
+"""
+Main service that orchestrates the intraday quote refresh process
+
+     Responsibilities:
+     1. Poll the request queue for tickers due for refresh
+     2. Batch and call FactSet Snapshot API
+     3. Write results to fulfillment table
+     4. Update queue with next refresh times
+     """
+
+     def __init__(self, config: Config):
+         self.config = config
+         self.api_client = FactSetSnapshotClient(config)
+         self.db = IntradayDatabase(config)
+         self.running = False
+
+     def is_market_open(self) -> bool:
+         """
+         Check if North American market is currently open
+
+         Market hours: 9:30 AM - 4:00 PM Eastern Time
+         """
+         # Get current time in Eastern
+         # NOTE: For production, use pytz for proper timezone handling
+         now = datetime.now()  # Assumes server is in Eastern Time
+
+         # Check day of week (Monday=0, Sunday=6)
+         if now.weekday() >= 5:  # Saturday or Sunday
+             return False
+
+         # Check time
+         market_open = now.replace(
+             hour=self.config.market_open_hour,
+             minute=self.config.market_open_minute,
+             second=0,
+             microsecond=0
+         )
+         market_close = now.replace(
+             hour=self.config.market_close_hour,
+             minute=self.config.market_close_minute,
+             second=0,
+             microsecond=0
+         )
+
+         return market_open <= now <= market_close
+
+     def process_batch(self) -> int:
+         """
+         Process one batch of pending requests
+
+         Returns:
+             Number of quotes processed
+         """
+         # Get pending requests
+         requests = self.db.get_pending_requests(limit=self.config.batch_size)
+
+         if not requests:
+             logger.debug("No requests due for refresh")
+             return 0
+
+         # Extract symbols for API call
+         symbols = [r.ticker_exchange for r in requests]
+
+         # Call FactSet API
+         try:
+             response = self.api_client.get_quotes(symbols)
+             quotes = self.api_client.parse_response(response, requests)
+         except Exception as e:
+             logger.error(f"API call failed: {e}")
+             # Mark all as failed
+             quotes = [
+                 IntradayQuote(
+                     ticker_id=r.ticker_id,
+                     ticker_exchange=r.ticker_exchange,
+                     success=False,
+                     error_message=str(e)
+                 )
+                 for r in requests
+             ]
+
+         # Write results
+         self.db.write_fulfillment(quotes)
+
+         return len(quotes)
+
+     def run_once(self) -> int:
+         """
+         Run one cycle of the polling loop
+
+         Returns:
+             Number of quotes processed (0 if market closed or nothing due)
+         """
+         if not self.is_market_open():
+             logger.debug("Market is closed")
+             return 0
+
+         return self.process_batch()
+
+     def run(self):
+         """
+         Main polling loop - runs until interrupted
+         """
+         logger.info("Starting FactSet Intraday Caller")
+         logger.info(f"Poll interval: {self.config.poll_interval_seconds} seconds")
+         logger.info(f"Batch size: {self.config.batch_size}")
+
+         # Log initial stats
+         stats = self.db.get_stats()
+         logger.info(f"Queue stats: {stats}")
+
+         self.running = True
+
+         try:
+             while self.running:
+                 try:
+                     processed = self.run_once()
+
+                     if processed > 0:
+                         logger.info(f"Processed {processed} quotes")
+
+                 except Exception as e:
+                     logger.error(f"Error in polling loop: {e}", exc_info=True)
+
+                 # Sleep until next poll
+                 time.sleep(self.config.poll_interval_seconds)
+
+         except KeyboardInterrupt:
+             logger.info("Received interrupt, shutting down...")
+
+         finally:
+             self.db.close()
+             logger.info("FactSet Intraday Caller stopped")
+
+     def stop(self):
+         """Signal the polling loop to stop"""
+         self.running = False
+
+
+# =============================================================================
+# CLI Entry Point
+# =============================================================================
+
+def main():
+parser = argparse.ArgumentParser(
+description='FactSet Intraday Snapshot API Caller'
+)
+parser.add_argument(
+'--config', '-c',
+help='Path to YAML configuration file',
+default='config.yaml'
+)
+parser.add_argument(
+'--env',
+action='store_true',
+help='Load configuration from environment variables'
+)
+parser.add_argument(
+'--once',
+action='store_true',
+help='Run once and exit (for testing)'
+)
+parser.add_argument(
+'--stats',
+action='store_true',
+help='Print queue stats and exit'
+)
+parser.add_argument(
+'--verbose', '-v',
+action='store_true',
+help='Enable verbose logging'
+)
+
+     args = parser.parse_args()
+
+     if args.verbose:
+         logging.getLogger().setLevel(logging.DEBUG)
+
+     # Load configuration
+     if args.env:
+         config = Config.from_env()
+     else:
+         if not os.path.exists(args.config):
+             logger.error(f"Config file not found: {args.config}")
+             sys.exit(1)
+         config = Config.from_yaml(args.config)
+
+     # Create caller
+     caller = FactSetIntradayCaller(config)
+
+     # Run based on mode
+     if args.stats:
+         stats = caller.db.get_stats()
+         print(f"Queue Statistics:")
+         for key, value in stats.items():
+             print(f"  {key}: {value}")
+
+     elif args.once:
+         processed = caller.run_once()
+         print(f"Processed {processed} quotes")
+
+     else:
+         caller.run()
+
+
+if __name__ == '__main__':
+main()
+
+-----------------------------------
+
+
+
+
+● Read(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/source-code/secmaster/server/src/main/java/com/alphatheory/securitymaster/server/service/FactSetAlphaTheoryApiDataFactoryProvider.java)
+⎿  Read 261 lines
+
+● I'm looking at this and I realize: I don't think this decision logic currently exists in an explicit form.
+
+Looking at what I've seen:
+
+Current Reality
+
+DPT side:
+- TickerHistoryLiveQuartzJob periodically reads from TickerHistoryLive → updates JCS cache
+- Frontend reads from JCS cache for "current" prices
+- Historical prices come from somewhere else (probably direct queries to TickerHistory)
+
+SecMaster side:
+- Providers return data, but they don't decide "TickerHistoryLive vs TickerHistory"
+- The quote() method just calls the provider and returns whatever it gets
+
+The Gap
+
+There's no logic that says:
+if (requestedDate == today) {
+return readFromTickerHistoryLive();
+} else {
+return readFromTickerHistory();
+}
+
+The current system relies on:
+1. Background processes populating TickerHistoryLive
+2. DPT's cache layer reading from TickerHistoryLive
+3. Implicit separation: "cache = current", "TickerHistory = historical"
+
+Your Question Restated
+
+You're asking: Where should the explicit routing logic live?
+
+Options:
+1. In getQuote(): Check the date, route to appropriate source
+2. In a unified provider: One provider that knows both sources
+3. Pre-staged: Background processes ensure TickerHistoryLive always has "current best price" regardless of source (API or EOD)
+
+For option 3, the decision becomes: What counts as "today's" data?
+- If market is open + we have intraday API data → use intraday
+- If market is closed OR no intraday → use latest EOD from fgp_prices
+- Historical dates → use derived table
+
+Is this the logic you're trying to define?
+
+✻ Baked for 58s
+
+❯ if you can't see everything ...       public TickerHistoryResponse execute(final TickerHistoryRequest request) {  this is what actually runs and what we are working with ...    1) can we (I think we should!)  have some scheduler that runs stored procedures for FactSet throughout the day?  a) FDS-FGP-Orchestration --> the original
+purpose of this project ;  b) FDS-Intraday-quote-snapshot-manager ...  what we need to build, knows when we last requested something and gives us the every-10-vs-every-60 minutes choices ...   ;    and then independently ... we want the ability to write to TickerHistoryLive for ALL tickers, based on FactSet EOD or Intraday(from the
+intermediate snapshot manager FULFILLMENT table) ...      ...  so this     public TickerHistoryResponse execute(final TickerHistoryRequest request) {  is in DPTv2, if you can look in ideaprojects\DPTv2
+
+● Let me find that method in DPTv2.
+
+● Bash(grep -r "TickerHistoryResponse execute" /mnt/c/Users/dzalika/IdeaProjects/dptv2/src --include="*.java" -l)
+⎿  /mnt/c/Users/dzalika/IdeaProjects/dptv2/src/main/java/com/wazollc/alphatheory/webservices/tickerhistory/TickerHistoryService.java
+
+● Read(src/main/java/com/wazollc/alphatheory/webservices/tickerhistory/TickerHistoryService.java)
+⎿  Read 166 lines
+
+● This calls tickerHistoryOperations.executeLookUps(). Let me trace that.
+
+● Read(src/main/java/com/wazollc/alphatheory/cache/TickerHistoryOperations.java)
+⎿  Error: File content (29050 tokens) exceeds maximum allowed tokens (25000). Please use offset and limit parameters to read specific portions of the file, or use the GrepTool to search for specific content.
+
+● Read(src/main/java/com/wazollc/alphatheory/cache/TickerHistoryOperations.java)
+⎿  Read 200 lines
+
+● Now I see the bigger picture. Let me synthesize what you're describing:
+
+The Architecture You're Proposing
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    SCHEDULED BACKGROUND PROCESSES                            │
+│                    (Run stored procedures throughout the day)                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  a) FDS-FGP-Orchestration (Original MCP Purpose)                            │
+│     ─────────────────────────────────────────────                           │
+│     - CA Pipeline: translate → daily factors → cumulative → derived         │
+│     - Price loads from FactSet                                              │
+│     - Outputs to: fds.factset_prices_adjusted_derived                       │
+│                                                                              │
+│  b) FDS-Intraday-Quote-Snapshot-Manager (NEW)                               │
+│     ────────────────────────────────────────────                            │
+│     - Tracks: when did we last request each ticker?                         │
+│     - Decides: 10-minute tier vs 60-minute tier                             │
+│     - Calls: FactSet Snapshot API (surgical, pay-per-request)               │
+│     - Outputs to: fds.intraday_snapshot_fulfillment (intermediate table)    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+│
+│ Both feed into...
+▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  TICKERHISTORYLIVE WRITER (Unified)                                         │
+│  ─────────────────────────────────────                                      │
+│  For ALL tickers, write "current best price" to TickerHistoryLive:          │
+│                                                                              │
+│  Source Priority:                                                            │
+│  1. Intraday fulfillment table (if available and fresh)                     │
+│  2. Latest EOD from fds.fgp_v1.fgp_prices (if no intraday)                 │
+│                                                                              │
+│  Output: TickerHistoryLive (one row per ticker, always current best)        │
+└─────────────────────────────────────────────────────────────────────────────┘
+│
+▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  DPT (Existing)                                                             │
+│  ────────────────                                                           │
+│  TickerHistoryLiveQuartzJob reads TickerHistoryLive → JCS Cache → Frontend  │
+│  TickerHistoryOperations.execute() for historical requests                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+The Intermediate Tables
+
+-- Intraday Snapshot Manager's fulfillment table
+CREATE TABLE fds.intraday_snapshot_fulfillment (
+tickerID            INT PRIMARY KEY,
+ticker_exchange     VARCHAR(50),
+
+      -- API response data
+      last_price          DECIMAL(18,6),
+      bid                 DECIMAL(18,6),
+      ask                 DECIMAL(18,6),
+      volume              BIGINT,
+      trade_time          DATETIME2,
+
+      -- Tracking
+      last_requested      DATETIME2,
+      last_fulfilled      DATETIME2,
+      refresh_tier        INT,  -- 1=10min, 2=60min
+      next_refresh_due    DATETIME2
+);
+
+The Question: Can This Be a QuoteScheduler?
+
+Yes - but in DPT, not SecMaster. The existing TickerHistoryOperations already:
+- Gets list of tickers to process
+- Calls SecMaster (via securityMasterUtils)
+- Writes results
+
+A new scheduler could:
+1. Read from fds.intraday_snapshot_fulfillment + fds.fgp_v1.fgp_prices
+2. Merge: intraday where available, EOD otherwise
+3. Write to TickerHistoryLive
+
+This would be alongside existing TickerHistory jobs, not replacing them.
+
+Does this match what you're envisioning?
+
+✻ Cooked for 56s
+
+❯ No, we have to do this without changing TickerHistoryOperations?   DPTv2 will get the list of tickers, but sec master will know separately ...  I don't think we can give this orchestration to DPTv2, if we can have a separate system, or possibly another that's in Sec Master?
+
+● Got it. DPTv2 stays unchanged. The orchestration lives elsewhere.
+
+Options for Where the Orchestration Lives
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  OPTION A: In SecMaster (alongside QuoteScheduler)                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  SecMaster already has:                                                      │
+│  - QuoteScheduler (calls SelectFeed, writes to TickerHistoryLive)           │
+│  - TickerHistoryLiveService.quotesUpdate()                                  │
+│  - Provider infrastructure                                                   │
+│                                                                              │
+│  Add:                                                                        │
+│  - FactSetIntradayScheduler (manages 10min/60min tiers)                     │
+│  - Reads from orchestration table (fds.intraday_refresh_queue)              │
+│  - Calls FactSet Snapshot API                                               │
+│  - Writes to TickerHistoryLive via existing service                         │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  OPTION B: Separate Service (new microservice)                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  New: "FDS Orchestration Service"                                           │
+│  - Runs independently                                                        │
+│  - Manages both:                                                             │
+│    a) FGP CA pipeline (stored procedures)                                   │
+│    b) Intraday snapshot refresh (API calls + fulfillment table)             │
+│  - Writes directly to TickerHistoryLive                                     │
+│                                                                              │
+│  Pro: Clean separation, doesn't touch SecMaster                             │
+│  Con: Another service to deploy/maintain                                    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  OPTION C: The MCP becomes the orchestration layer                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  fds-fgp-orchestration-mcp (what we're building) expands to:                │
+│  - Run CA pipeline stored procedures (already doing this)                   │
+│  - Run intraday refresh stored procedures (new)                             │
+│  - The SQL does the work, MCP just orchestrates                             │
+│                                                                              │
+│  The "TickerHistoryLive writer" becomes a stored procedure that:            │
+│  - Reads from fulfillment table + fgp_prices                                │
+│  - Merges and writes to TickerHistoryLive                                   │
+│                                                                              │
+│  Pro: All FactSet orchestration in one place, SQL-driven                    │
+│  Con: MCP needs to call external API (FactSet Snapshot) somehow             │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+My Read
+
+Option C feels closest to what you're describing - SQL-driven orchestration where:
+- Stored procedures do the heavy lifting
+- The orchestration layer (MCP or a scheduler) just triggers them
+- TickerHistoryLive gets populated by SQL, not Java code
+
+The FactSet Snapshot API call is the tricky part - that can't be pure SQL. But the fulfillment table could be populated by a simple API caller, and then SQL handles the rest.
+
+Which direction are you leaning?
+
+❯ We're building the MCP really as a design tool, agnostic of the implementation destination, and that's very helpful.   But we want something that basically always polls and creates the "tickers held by clients" and that completes the INIT steps ...  and the workflow, what's ACTUALLY writing to TickerHistoryLive?   Can that be SQL
+as well?    It's like we want a NEW job that is called whenever that builds the intermediate artifacts so that getQuote() is more or less a dumb job by the time it's called.   We could have some always on system that is responsible for ...  TickerRequestor_Intraday_Snapshot -->  For the 10 minute / 60 minute / FDS_FGP_Latest
+selection;    TickerHistoryLive writing, from the TickerRequestor_Intraday_Snapshot   ;   TickerHistory writing, from vendors.fds.factset_prices_adjusted_derived ...    We want the stored procedures to be able to run _from anywhere_, rather than now plugging an MCP into the process.
+
+● Now I understand. The MCP is a design tool, not the runtime. The actual implementation is stored procedures that can run from anywhere.
+
+The Vision: SQL-Driven, Always-On System
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  INIT / POLLING (Always Running)                                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  sp_refresh_tickers_with_holding_counts                                     │
+│  - Builds/refreshes the priority list                                       │
+│  - Runs periodically (every 5 min? 15 min?)                                 │
+│  - Output: TickerMapping.snapshots.tickers_with_holding_counts              │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+│
+▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  WRITER 1: TickerRequestor_Intraday_Snapshot                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  sp_queue_intraday_requests                                                 │
+│  - Reads from tickers_with_holding_counts                                   │
+│  - Determines: 10-min tier vs 60-min tier vs skip                           │
+│  - Filters: N region, USD, market hours                                     │
+│  - Output: fds.intraday_request_queue (what to request next)                │
+│                                                                              │
+│  [External API Caller - NOT SQL]                                            │
+│  - Reads from fds.intraday_request_queue                                    │
+│  - Calls FactSet Snapshot API                                               │
+│  - Output: fds.intraday_snapshot_fulfillment                                │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+│
+▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  WRITER 2: TickerHistoryLive (SQL)                                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  sp_write_ticker_history_live                                               │
+│  - For ALL tickers in tickers_with_holding_counts:                          │
+│    - IF intraday available (from fulfillment table) → use it               │
+│    - ELSE use latest EOD (from fds.fgp_v1.fgp_prices)                      │
+│  - MERGE into TickerHistoryLive                                             │
+│                                                                              │
+│  This is pure SQL. No Java. No SecMaster.                                   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+│
+▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  WRITER 3: TickerHistory (SQL)                                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  sp_write_ticker_history_from_derived                                       │
+│  - Reads from vendors.fds.factset_prices_adjusted_derived                   │
+│  - Writes historical EOD to TickerHistory                                   │
+│  - CA-adjusted prices for historical dates                                  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+│
+▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  getQuote() - NOW DUMB                                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  - Today/current? → Read from TickerHistoryLive (already populated)         │
+│  - Historical? → Read from TickerHistory (already populated)                │
+│  - No orchestration, no provider selection, just read.                      │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+What's SQL vs What's Not
+┌─────────────────────────────────────┬─────────────┬─────────────────────────────────────┐
+│              Component              │ Can be SQL? │                Notes                │
+├─────────────────────────────────────┼─────────────┼─────────────────────────────────────┤
+│ tickers_with_holding_counts refresh │ ✅ Yes      │ Already exists                      │
+├─────────────────────────────────────┼─────────────┼─────────────────────────────────────┤
+│ Intraday queue management           │ ✅ Yes      │ Determine what needs refresh        │
+├─────────────────────────────────────┼─────────────┼─────────────────────────────────────┤
+│ FactSet Snapshot API call           │ ❌ No       │ External HTTP call                  │
+├─────────────────────────────────────┼─────────────┼─────────────────────────────────────┤
+│ Write to fulfillment table          │ ✅ Yes      │ API caller writes here              │
+├─────────────────────────────────────┼─────────────┼─────────────────────────────────────┤
+│ TickerHistoryLive writer            │ ✅ Yes      │ MERGE from fulfillment + fgp_prices │
+├─────────────────────────────────────┼─────────────┼─────────────────────────────────────┤
+│ TickerHistory writer                │ ✅ Yes      │ MERGE from derived table            │
+└─────────────────────────────────────┴─────────────┴─────────────────────────────────────┘
+The Only Non-SQL Piece
+
+A simple API caller that:
+1. SELECT * FROM fds.intraday_request_queue WHERE next_request_due <= GETDATE()
+2. Call FactSet Snapshot API
+3. INSERT INTO fds.intraday_snapshot_fulfillment
+
+That's it. Everything else is stored procedures.
+
+Does this match what you're envisioning?
+
+✻ Worked for 33s
+
+❯ how can we manage this?     ┌─────────────────────────────────────────────────────────────────────────────┐                                                                               
+│  WRITER 1: TickerRequestor_Intraday_Snapshot                                │                                                                                                           
+├─────────────────────────────────────────────────────────────────────────────┤                                                                                                           
+│                                                                              │                                                                                                          
+│  sp_queue_intraday_requests                                                 │                                                                                                           
+│  - Reads from tickers_with_holding_counts                                   │                                                                                                           
+│  - Determines: 10-min tier vs 60-min tier vs skip                           │                                                                                                           
+│  - Filters: N region, USD, market hours                                     │                                                                                                           
+│  - Output: fds.intraday_request_queue (what to request next)                │                                                                                                           
+│                                                                              │                                                                                                          
+│  [External API Caller - NOT SQL]                                            │                                                                                                           
+│  - Reads from fds.intraday_request_queue                                    │                                                                                                           
+│  - Calls FactSet Snapshot API                                               │                                                                                                           
+│  - Output: fds.intraday_snapshot_fulfillment        ... it's certainly new ...  we might have to have an entirely separate process, because it cannot be connected directly to TickerHistory or tickerHistoryLive
+
+● Right. The API caller is its own thing - separate from everything else.
+
+The Isolated API Caller
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  FactSet Intraday API Caller (Standalone Process)                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  INPUT:  fds.intraday_request_queue                                         │
+│          (populated by SQL stored procedure)                                │
+│                                                                              │
+│  PROCESS:                                                                    │
+│  1. Poll queue: SELECT WHERE next_request_due <= NOW()                      │
+│  2. Batch tickers                                                           │
+│  3. Call FactSet Snapshot API                                               │
+│  4. Parse response                                                          │
+│                                                                              │
+│  OUTPUT: fds.intraday_snapshot_fulfillment                                  │
+│          (consumed by SQL stored procedure)                                 │
+│                                                                              │
+│  KNOWS NOTHING ABOUT:                                                        │
+│  - TickerHistory                                                            │
+│  - TickerHistoryLive                                                        │
+│  - DPT                                                                       │
+│  - SecMaster                                                                 │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Implementation Options
+┌─────────────────────────────┬───────────────────────────────────────────────────────┬─────────────────────────────────┐
+│           Option            │                         Pros                          │              Cons               │
+├─────────────────────────────┼───────────────────────────────────────────────────────┼─────────────────────────────────┤
+│ Python script               │ Simple, fast to build, can run as cron/scheduled task │ Another language in the stack   │
+├─────────────────────────────┼───────────────────────────────────────────────────────┼─────────────────────────────────┤
+│ Java microservice           │ Matches existing stack                                │ Heavier, more ceremony          │
+├─────────────────────────────┼───────────────────────────────────────────────────────┼─────────────────────────────────┤
+│ Node.js service             │ Lightweight, good for HTTP calls                      │ Another runtime                 │
+├─────────────────────────────┼───────────────────────────────────────────────────────┼─────────────────────────────────┤
+│ Azure Function / AWS Lambda │ Serverless, scales, triggered by timer                │ Cloud dependency                │
+├─────────────────────────────┼───────────────────────────────────────────────────────┼─────────────────────────────────┤
+│ Part of MCP                 │ Already building it                                   │ MCP is design tool, not runtime │
+└─────────────────────────────┴───────────────────────────────────────────────────────┴─────────────────────────────────┘
+What It Needs
+
+Config:
+- FactSet API credentials
+- Database connection (to read queue, write fulfillment)
+- Polling interval (every 30 seconds? 1 minute?)
+
+Loop:
+1. Check: Is N-region market open? If not, sleep.
+2. Query: SELECT * FROM fds.intraday_request_queue
+WHERE next_request_due <= GETDATE()
+ORDER BY refresh_tier, priority
+LIMIT batch_size
+3. Call: FactSet Snapshot API with ticker_exchange list
+4. Write: INSERT/UPDATE fds.intraday_snapshot_fulfillment
+5. Update: SET last_requested = NOW(),
+next_request_due = NOW() + interval
+6. Sleep briefly, repeat
+
+The Question
+
+This is genuinely new infrastructure. What's your preference for where it lives?
+
+- A standalone service (simplest, most isolated)
+- Inside SecMaster (has existing scheduler infrastructure)
+- Something else?
+
+❯ how does this look?    │ Python script               │ Simple, fast to build, can run as cron/scheduled task │ Another language in the stack   │      vs. Java ...  and to the design specs as required by the SnapshotAPI, and documented in the FactSetExchangeDataFeedSnapshotAPI.md file
+
+● Let me look at the Snapshot API documentation to understand the requirements.
+
+● Bash(find /mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp -name "*SnapshotAPI*" -o -name "*Snapshot*API*" 2>/dev/null)
+⎿  /mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/fds-modules/intraday/FactSetExchangeDataFeedSnapshotAPI_SymbolList_DataModel_V1.md
+
+● Read(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/fds-modules/intraday/FactSetExchangeDataFeedSnapshotAPI_SymbolList_DataModel_V1.md)
+⎿  Error: File content (62777 tokens) exceeds maximum allowed tokens (25000). Please use offset and limit parameters to read specific portions of the file, or use the GrepTool to search for specific content.
+
+● Read(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/fds-modules/intraday/FactSetExchangeDataFeedSnapshotAPI_SymbolList_DataModel_V1.md)
+⎿  Read 200 lines
+
+● Read(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/fds-modules/intraday/FactSetExchangeDataFeedSnapshotAPI_SymbolList_DataModel_V1.md)
+⎿  Read 150 lines
+
+● Read(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/fds-modules/intraday/FactSetExchangeDataFeedSnapshotAPI_SymbolList_DataModel_V1.md)
+⎿  Read 150 lines
+
+● Now I understand the API. Let me compare Python vs Java for this use case:
+
+API Requirements Summary
+
+Request: Symbol list in TICKER-EXCHANGE format (e.g., AAPL-USA, META-USA)
+
+Key Response Fields:
+┌─────┬────────────────┬─────────────────────────┐
+│ FID │     Field      │         Purpose         │
+├─────┼────────────────┼─────────────────────────┤
+│ 50  │ LAST_PRICE     │ Current price           │
+├─────┼────────────────┼─────────────────────────┤
+│ 31  │ LAST_VOL       │ Last trade volume       │
+├─────┼────────────────┼─────────────────────────┤
+│ 132 │ CVOL           │ Cumulative daily volume │
+├─────┼────────────────┼─────────────────────────┤
+│ 107 │ HIGH           │ Intraday high           │
+├─────┼────────────────┼─────────────────────────┤
+│ 158 │ OPEN           │ Opening price           │
+├─────┼────────────────┼─────────────────────────┤
+│ 208 │ PREV_CLOSE     │ Previous close          │
+├─────┼────────────────┼─────────────────────────┤
+│ 62  │ PRICE_CURRENCY │ Trading currency        │
+├─────┼────────────────┼─────────────────────────┤
+│ 17  │ ISO_CODE       │ Exchange code           │
+└─────┴────────────────┴─────────────────────────┘
+Python vs Java Comparison
+┌──────────────────┬──────────────────────────────────┬────────────────────────────────────┐
+│      Aspect      │              Python              │                Java                │
+├──────────────────┼──────────────────────────────────┼────────────────────────────────────┤
+│ HTTP Client      │ requests / httpx - simple, clean │ HttpClient / OkHttp - more verbose │
+├──────────────────┼──────────────────────────────────┼────────────────────────────────────┤
+│ JSON Parsing     │ Built-in json module             │ Jackson/Gson - requires dependency │
+├──────────────────┼──────────────────────────────────┼────────────────────────────────────┤
+│ SQL Connection   │ pyodbc / pymssql                 │ JDBC - native, well-tested         │
+├──────────────────┼──────────────────────────────────┼────────────────────────────────────┤
+│ Scheduling       │ schedule lib or cron             │ Quartz / @Scheduled                │
+├──────────────────┼──────────────────────────────────┼────────────────────────────────────┤
+│ Deployment       │ Script + cron, or systemd        │ JAR + service wrapper              │
+├──────────────────┼──────────────────────────────────┼────────────────────────────────────┤
+│ Lines of Code    │ ~150-200                         │ ~400-500                           │
+├──────────────────┼──────────────────────────────────┼────────────────────────────────────┤
+│ Startup Time     │ Instant                          │ JVM warmup                         │
+├──────────────────┼──────────────────────────────────┼────────────────────────────────────┤
+│ Memory           │ ~50MB                            │ ~200MB+                            │
+├──────────────────┼──────────────────────────────────┼────────────────────────────────────┤
+│ Existing Stack   │ New language                     │ Matches DPT/SecMaster              │
+├──────────────────┼──────────────────────────────────┼────────────────────────────────────┤
+│ Team Familiarity │ ?                                │ Known                              │
+└──────────────────┴──────────────────────────────────┴────────────────────────────────────┘
+Python Implementation Sketch
+
+# factset_intraday_caller.py (~150 lines total)
+
+import requests
+import pyodbc
+import time
+from datetime import datetime
+
+class FactSetIntradayCaller:
+def __init__(self, config):
+self.api_url = config['factset_api_url']
+self.api_key = config['factset_api_key']
+self.db_conn = pyodbc.connect(config['db_connection'])
+
+      def get_pending_requests(self):
+          """Read from queue table"""
+          sql = """
+              SELECT tickerID, ticker_exchange
+              FROM fds.intraday_request_queue
+              WHERE next_request_due <= GETDATE()
+                AND fds_region_code = 'N'
+              ORDER BY refresh_tier, countInstances DESC
+          """
+          return self.db_conn.execute(sql).fetchall()
+
+      def call_factset_api(self, symbols):
+          """Call FactSet Snapshot API"""
+          response = requests.post(
+              self.api_url,
+              headers={'Authorization': f'Bearer {self.api_key}'},
+              json={'symbols': symbols, 'fields': [50, 31, 132, 107, 158, 208, 62]}
+          )
+          return response.json()
+
+      def write_fulfillment(self, results):
+          """Write to fulfillment table"""
+          sql = """
+              MERGE INTO fds.intraday_snapshot_fulfillment AS target
+              USING (SELECT ?, ?, ?, ?, ?) AS source (tickerID, last_price, ...)
+              ON target.tickerID = source.tickerID
+              WHEN MATCHED THEN UPDATE SET ...
+              WHEN NOT MATCHED THEN INSERT ...
+          """
+          # batch execute
+
+      def run(self):
+          while True:
+              if not self.is_market_open():
+                  time.sleep(60)
+                  continue
+
+              pending = self.get_pending_requests()
+              if pending:
+                  symbols = [p.ticker_exchange for p in pending]
+                  results = self.call_factset_api(symbols)
+                  self.write_fulfillment(results)
+
+              time.sleep(30)
+
+Java Implementation Sketch
+
+// FactSetIntradayCaller.java (~400 lines total)
+
+@Service
+public class FactSetIntradayCaller {
+
+      @Autowired
+      private DataSource dataSource;
+
+      @Value("${factset.api.url}")
+      private String apiUrl;
+
+      @Scheduled(fixedRate = 30000)
+      public void poll() {
+          if (!isMarketOpen()) return;
+
+          List<IntradayRequest> pending = getPendingRequests();
+          if (pending.isEmpty()) return;
+
+          List<String> symbols = pending.stream()
+              .map(IntradayRequest::getTickerExchange)
+              .collect(Collectors.toList());
+
+          FactSetResponse response = callFactSetApi(symbols);
+          writeFulfillment(response);
+      }
+
+      // ... 300 more lines for HTTP client setup,
+      //     JSON parsing, SQL operations, error handling
+}
+
+My Recommendation
+
+Python for this specific component because:
+1. It's a standalone, isolated process - doesn't need to integrate with Java codebase
+2. Simple HTTP + SQL - Python excels at this
+3. Fast iteration - easy to modify as requirements evolve
+4. Smaller footprint - runs alongside, not inside, existing systems
+5. The stored procedures do the real work - this is just a thin API caller
+
+The Python script would be:
+- ~150 lines
+- Run as a systemd service or container
+- Read from SQL queue, call API, write to SQL fulfillment table
+- No knowledge of DPT, SecMaster, TickerHistory
+
+Does this help with the decision?
+
+✻ Crunched for 58s
+
+❯ let's say for every ticker we'll give it the correct FactSet identifier and we'll make the request, capture the resultant dataframe, and save it to the table ...   1. Can you get the       def __init__(self, config):
+self.api_url = config['factset_api_url']                                                                                                                                                  
+self.api_key = config['factset_api_key']                                                                                                                                                  
+self.db_conn = pyodbc.connect(config['db_connection'])  and make the call per the requirements?  Can you go a step further into the python example, with real details?
+
+● Let me create a detailed Python implementation. First, let me check if there's more specific API endpoint information in the documentation.
+
+● Read(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/fds-modules/intraday/FactSetExchangeDataFeedSnapshotAPI_SymbolList_DataModel_V1.md)
+⎿  Read 200 lines
+
+● Read(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/fds-modules/intraday/FactSetExchangeDataFeedSnapshotAPI_SymbolList_DataModel_V1.md)
+⎿  Read 200 lines
+
+● Read(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/fds-modules/intraday/FactSetExchangeDataFeedSnapshotAPI_SymbolList_DataModel_V1.md)
+⎿  Read 150 lines
+
+● Now I have enough to create a detailed implementation. The document shows:
+- Symbology: TICKER-EXCHANGE format (e.g., AAPL-USA, VOD-LON)
+- Delayed fallback: Append :D for explicit delayed, or API auto-falls back if not entitled to real-time
+- FIDs: Field identifiers for each data point
+
+Let me create a proper Python implementation:
+
+● Write(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/fds-modules/intraday/factset_intraday_caller.py)
+⎿  Tool use rejected with user message: almost ... but I want to understand better what is the receiving table?   This?
+# Write to fulfillment table
+fulfillment_sql = """
+MERGE INTO fds.intraday_snapshot_fulfillment AS target
+USING (SELECT
+? AS tickerID,
+? AS ticker_exchange,
+? AS last_price,
+? AS last_volume,
+? AS cumulative_volume,
+? AS high,
+? AS low,
+? AS open_price,
+? AS prev_close,
+? AS bid,
+? AS ask,
+? AS currency,
+? AS exchange_code,
+? AS trade_time,
+? AS vwap,
+? AS trade_count,
+? AS success,
+? AS error_message,
+GETDATE() AS fulfilled_at
+) AS source
+ON target.tickerID = source.tickerID
+WHEN MATCHED THEN UPDATE SET
+ticker_exchange = source.ticker_exchange,
+last_price = source.last_price,
+last_volume = source.last_volume,
+cumulative_volume = source.cumulative_volume,
+high = source.high,
+low = source.low,
+open_price = source.open_price,
+prev_close = source.prev_close,
+bid = source.bid,
+ask = source.ask,
+currency = source.currency,
+exchange_code = source.exchange_code,
+trade_time = source.trade_time,
+vwap = source.vwap,
+trade_count = source.trade_count,
+success = source.success,
+error_message = source.error_message,
+fulfilled_at = source.fulfilled_at
+WHEN NOT MATCHED THEN INSERT (
+tickerID, ticker_exchange, last_price, last_volume,
+cumulative_volume, high, low, open_price, prev_close,
+bid, ask, currency, exchange_code, trade_time,
+vwap, trade_count, success, error_message, fulfilled_at
+) VALUES (
+source.tickerID, source.ticker_exchange, source.last_price,
+source.last_volume, source.cumulative_volume, source.high,
+source.low, source.open_price, source.prev_close,
+source.bid, source.ask, source.currency, source.exchange_code,
+source.trade_time, source.vwap, source.trade_count,
+source.success, source.error_message, source.fulfilled_at
+);   ..   what if we need to also have Options, delta values?  How can we add more fields?
+
+● Good question. Let me clarify the table design and extensibility:
+
+The Fulfillment Table
+
+Yes, fds.intraday_snapshot_fulfillment is the receiving table - it stores the raw API results. This is an intermediate table between the API and TickerHistoryLive.
+
+Current Schema (Equities Focus)
+
+CREATE TABLE fds.intraday_snapshot_fulfillment (
+-- Identity
+tickerID            INT PRIMARY KEY,
+ticker_exchange     VARCHAR(50),       -- AAPL-USA
+
+      -- Core Pricing (all security types)
+      last_price          DECIMAL(18,6),
+      last_volume         BIGINT,
+      cumulative_volume   BIGINT,
+      high                DECIMAL(18,6),
+      low                 DECIMAL(18,6),
+      open_price          DECIMAL(18,6),
+      prev_close          DECIMAL(18,6),
+      bid                 DECIMAL(18,6),
+      ask                 DECIMAL(18,6),
+
+      -- Metadata
+      currency            CHAR(3),
+      exchange_code       VARCHAR(10),
+      trade_time          DATETIME2,
+      vwap                DECIMAL(18,6),
+      trade_count         INT,
+
+      -- Status
+      success             BIT,
+      error_message       NVARCHAR(500),
+      fulfilled_at        DATETIME2
+);
+
+Extended Schema (With Options Greeks)
+
+From the FactSet documentation, Options have additional fields. But there's a caveat:
+
+"Note: Options Greeks are only available for Enterprise streaming in the C++, .NET, JAVA and COM toolkits. Greek Options are not available for Datalink streaming or Snapshot."
+
+However, if you have access, here are the FIDs for Options:
+
+-- Extended table for Options support
+ALTER TABLE fds.intraday_snapshot_fulfillment ADD
+-- Options-specific fields
+security_type       VARCHAR(20),       -- 'Equity', 'Option', 'Future', etc.
+strike_price        DECIMAL(18,6),     -- FID 239
+expiration_date     DATE,              -- FID 713
+contract_size       INT,               -- FID 51
+open_interest       BIGINT,            -- FID 711
+
+      -- Options Greeks (if available via API)
+      delta               DECIMAL(18,6),
+      gamma               DECIMAL(18,6),
+      theta               DECIMAL(18,6),
+      vega                DECIMAL(18,6),
+      rho                 DECIMAL(18,6),
+      implied_volatility  DECIMAL(18,6);
+
+How to Add More Fields
+
+The pattern is simple:
+
+1. Find the FID in the documentation:
+   class FID:
+   # Existing
+   LAST_PRICE = 50
+
+   # Add new fields
+   STRIKE_PRICE = 239
+   EXPIRATION_DATE = 713
+   OPEN_INTEREST = 711
+   # Greeks (if available)
+   DELTA = ???  # Need to confirm FID
+
+2. Add to the request list:
+   ALL_FIELDS = [
+   LAST_PRICE, LAST_VOL, ...,
+   STRIKE_PRICE, EXPIRATION_DATE, OPEN_INTEREST  # New
+   ]
+
+3. Add to the dataclass:
+   @dataclass
+   class IntradayQuote:
+   # Existing
+   last_price: Optional[float] = None
+
+   # New fields
+   strike_price: Optional[float] = None
+   expiration_date: Optional[date] = None
+   open_interest: Optional[int] = None
+
+4. Add column to table and MERGE statement
+
+Alternative: JSON Column for Extensibility
+
+If you expect frequent schema changes, consider:
+
+CREATE TABLE fds.intraday_snapshot_fulfillment (
+tickerID            INT PRIMARY KEY,
+ticker_exchange     VARCHAR(50),
+security_type       VARCHAR(20),
+
+      -- Core fields (always needed)
+      last_price          DECIMAL(18,6),
+      trade_time          DATETIME2,
+
+      -- All other fields as JSON (flexible)
+      raw_fields          NVARCHAR(MAX),  -- JSON blob of all FID/value pairs
+
+      -- Parsed common fields (for querying)
+      bid                 DECIMAL(18,6),
+      ask                 DECIMAL(18,6),
+
+      -- Status
+      success             BIT,
+      fulfilled_at        DATETIME2
+);
+
+Then you can query JSON fields when needed:
+SELECT
+tickerID,
+last_price,
+JSON_VALUE(raw_fields, '$.239') AS strike_price,
+JSON_VALUE(raw_fields, '$.711') AS open_interest
+FROM fds.intraday_snapshot_fulfillment
+WHERE security_type = 'Option'
+
+Which Approach?
+┌───────────────┬────────────────────────────┬──────────────────────────────────┐
+│   Approach    │            Pros            │               Cons               │
+├───────────────┼────────────────────────────┼──────────────────────────────────┤
+│ Fixed columns │ Fast queries, clear schema │ Schema changes need DDL          │
+├───────────────┼────────────────────────────┼──────────────────────────────────┤
+│ JSON blob     │ Flexible, no DDL changes   │ Slower queries, less type safety │
+├───────────────┼────────────────────────────┼──────────────────────────────────┤
+│ Hybrid        │ Best of both               │ Slightly more complex            │
+└───────────────┴────────────────────────────┴──────────────────────────────────┘
+What's your preference? And do you need Options data specifically, or is this about general extensibility?
+
+✻ Worked for 2m 30s
+
+❯ Oh, for options ...    "Note: Options Greeks are only available for Enterprise streaming in the C++, .NET, JAVA and COM toolkits. Greek Options are not available for Datalink streaming or Snapshot."  we don't even get Delta from a snapshot API request?
+
+● Correct. According to the documentation:
+
+"Options Greeks are only available for Enterprise streaming in the C++, .NET, JAVA and COM toolkits. Greek Options are not available for Datalink streaming or Snapshot."
+
+What You GET from Snapshot for Options
+┌─────────────────┬─────┬────────────┐
+│      Field      │ FID │ Available? │
+├─────────────────┼─────┼────────────┤
+│ Last Price      │ 50  │ ✅ Yes     │
+├─────────────────┼─────┼────────────┤
+│ Bid             │ 410 │ ✅ Yes     │
+├─────────────────┼─────┼────────────┤
+│ Ask             │ 407 │ ✅ Yes     │
+├─────────────────┼─────┼────────────┤
+│ Volume          │ 31  │ ✅ Yes     │
+├─────────────────┼─────┼────────────┤
+│ Open Interest   │ 711 │ ✅ Yes     │
+├─────────────────┼─────┼────────────┤
+│ Strike Price    │ 239 │ ✅ Yes     │
+├─────────────────┼─────┼────────────┤
+│ Expiration Date │ 713 │ ✅ Yes     │
+├─────────────────┼─────┼────────────┤
+│ Contract Size   │ 51  │ ✅ Yes     │
+└─────────────────┴─────┴────────────┘
+What You DON'T Get from Snapshot
+┌────────────────────┬────────────┐
+│       Field        │ Available? │
+├────────────────────┼────────────┤
+│ Delta              │ ❌ No      │
+├────────────────────┼────────────┤
+│ Gamma              │ ❌ No      │
+├────────────────────┼────────────┤
+│ Theta              │ ❌ No      │
+├────────────────────┼────────────┤
+│ Vega               │ ❌ No      │
+├────────────────────┼────────────┤
+│ Rho                │ ❌ No      │
+├────────────────────┼────────────┤
+│ Implied Volatility │ ❌ No      │
+└────────────────────┴────────────┘
+Options for Getting Greeks
+
+1. FactSet Enterprise Streaming - C++/.NET/Java/COM toolkits (different API, different cost)
+2. Compute yourself - Given underlying price + option price + strike + expiry + rate, calculate via Black-Scholes
+3. FactSet Formula API - May have pre-computed Greeks as a different data product (not real-time)
+4. Third-party - Bloomberg, Refinitiv, or options analytics providers
+
+For Your Use Case
+
+If the intraday Snapshot caller is primarily for equity prices (which it sounds like from the tickers_with_holding_counts discussion), then this limitation doesn't matter much.
+
+If you need Options Greeks for portfolio risk calculations, that's a separate data pipeline - likely not real-time/intraday anyway, since Greeks can be computed from EOD data.
+
+Is Options Greeks a requirement, or is equity intraday pricing the priority?
+
+❯ it WILL be?  But nothing we can get right now then ... so if we DO need to process options, we'd need a separate receiving table
+
+● Exactly. Different security types, different APIs, different tables.
+
+Table Structure by Security Type
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  EQUITIES (Snapshot API)                                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  fds.intraday_snapshot_fulfillment_equity                                   │
+│  - tickerID, ticker_exchange                                                │
+│  - last_price, bid, ask, volume, high, low, open, prev_close               │
+│  - vwap, trade_count                                                        │
+│  - trade_time, fulfilled_at                                                 │
+│                                                                              │
+│  Source: FactSet Snapshot API (pay-per-request)                             │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  OPTIONS (Enterprise Streaming - FUTURE)                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  fds.intraday_snapshot_fulfillment_option                                   │
+│  - tickerID, ticker_exchange                                                │
+│  - last_price, bid, ask, volume, open_interest                             │
+│  - strike_price, expiration_date, contract_size                            │
+│  - delta, gamma, theta, vega, rho, implied_volatility                      │
+│  - underlying_ticker_id, underlying_price                                   │
+│  - trade_time, fulfilled_at                                                 │
+│                                                                              │
+│  Source: FactSet Enterprise Streaming API (different integration)           │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+The Orchestration View
+
+                      ┌─────────────────────────┐
+                      │  intraday_request_queue │
+                      │  (unified queue)        │
+                      └───────────┬─────────────┘
+                                  │
+                      ┌───────────┴───────────┐
+                      │                       │
+                      ▼                       ▼
+          ┌───────────────────┐   ┌───────────────────┐
+          │ security_type =   │   │ security_type =   │
+          │ 'Equity'          │   │ 'Option'          │
+          └─────────┬─────────┘   └─────────┬─────────┘
+                    │                       │
+                    ▼                       ▼
+          ┌───────────────────┐   ┌───────────────────┐
+          │ Snapshot API      │   │ Enterprise        │
+          │ Caller (Python)   │   │ Streaming (Java?) │
+          └─────────┬─────────┘   └─────────┬─────────┘
+                    │                       │
+                    ▼                       ▼
+          ┌───────────────────┐   ┌───────────────────┐
+          │ fulfillment_      │   │ fulfillment_      │
+          │ equity            │   │ option            │
+          └─────────┬─────────┘   └─────────┬─────────┘
+                    │                       │
+                    └───────────┬───────────┘
+                                │
+                                ▼
+                      ┌─────────────────────┐
+                      │  TickerHistoryLive  │
+                      │  (SQL MERGE from    │
+                      │   both sources)     │
+                      └─────────────────────┘
+
+For Now
+
+Focus on equities only:
+- fds.intraday_snapshot_fulfillment (or _equity suffix)
+- Snapshot API caller (Python)
+- North America, USD, 10min/60min tiers
+
+Options can be added later as a separate pipeline when Enterprise Streaming is available.
+
+Should I update the Python implementation to reflect _equity naming, or keep it generic for now?
+
+❯ I think we need to spend Muuuch more time on this layer, and I'm not even certain that we want to say we will ONLY have a python method.  We care more about the data layers and then
+the API or SQL are just fulfillment details
+
+● You're right. Let me step back from implementation details and focus on the data layer design.
+
+The Data Layers
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  LAYER 1: UNIVERSE (What tickers exist and who holds them?)                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  TickerMapping.snapshots.tickers_with_holding_counts                        │
+│  ├── tickerID, tickerName, tickerType                                       │
+│  ├── priority, countInstances                                               │
+│  ├── fsymID, fsymIdExchangeLevel                                           │
+│  └── snapshotTimestamp                                                       │
+│                                                                              │
+│  Refreshed: Periodically (every 15 min?)                                    │
+│  Source: Live holdings data                                                  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+│
+▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  LAYER 2: SYMBOLOGY (How do we identify each ticker to FactSet?)            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  sym_v1.sym_ticker_exchange                                                  │
+│  ├── fsym_id → ticker_exchange (e.g., AAPL-USA)                            │
+│                                                                              │
+│  fds.ticker_factset_price_coverage_summary                                  │
+│  ├── tickerID, fsym_id, fds_region_code                                    │
+│  └── (proposed: ticker_exchange, intraday_eligible)                        │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+│
+▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  LAYER 3: REQUEST QUEUE (What needs to be refreshed and when?)              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  fds.intraday_request_queue                                                  │
+│  ├── tickerID, tickerName, ticker_exchange, fsym_id                        │
+│  ├── security_type (Equity, Option, Future, ...)                           │
+│  ├── fds_region_code, currency_code                                         │
+│  ├── countInstances, refresh_tier, refresh_interval_minutes                │
+│  ├── last_requested, next_request_due                                       │
+│  └── eligible (computed: has symbology, correct region, etc.)              │
+│                                                                              │
+│  Refreshed: sp_build_intraday_request_queue (joins Layer 1 + 2)            │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+│
+▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  LAYER 4: FULFILLMENT (Raw results from external sources)                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  BY SECURITY TYPE:                                                           │
+│                                                                              │
+│  fds.intraday_fulfillment_equity                                            │
+│  ├── tickerID, ticker_exchange                                              │
+│  ├── last_price, bid, ask, volume, high, low, open, prev_close             │
+│  ├── vwap, trade_count, currency, exchange_code                            │
+│  ├── trade_time, fulfilled_at                                               │
+│  └── success, error_message                                                  │
+│                                                                              │
+│  fds.intraday_fulfillment_option (FUTURE)                                   │
+│  ├── tickerID, ticker_exchange                                              │
+│  ├── last_price, bid, ask, volume, open_interest                           │
+│  ├── strike_price, expiration_date, underlying_ticker_id                   │
+│  ├── delta, gamma, theta, vega, implied_volatility                         │
+│  └── trade_time, fulfilled_at                                               │
+│                                                                              │
+│  Source: External API (Snapshot, Streaming, etc.) - IMPLEMENTATION DETAIL   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+│
+▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  LAYER 5: EOD PRICES (Historical/adjusted prices from FGP pipeline)         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  fds.fgp_v1.fgp_prices (bronze - raw)                                       │
+│  ├── Latest date = unadjusted, can use directly                            │
+│                                                                              │
+│  fds.factset_prices_adjusted_derived (silver - CA-adjusted)                │
+│  ├── Historical dates = adjusted for corporate actions                     │
+│                                                                              │
+│  Source: FDS-FGP-Orchestration pipeline (what we've been building)          │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+│
+▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  LAYER 6: OUTPUT (Unified current prices for consumption)                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  TickerHistoryLive                                                           │
+│  ├── tickerID                                                                │
+│  ├── price, bid, ask, volume, ...                                           │
+│  ├── price_source ('intraday_equity', 'intraday_option', 'eod_fgp')        │
+│  ├── price_time                                                              │
+│  └── updated_at                                                              │
+│                                                                              │
+│  Populated by: sp_write_ticker_history_live                                 │
+│  ├── Merges intraday fulfillment (if fresh)                                │
+│  └── Falls back to EOD from fgp_prices (if no intraday)                    │
+│                                                                              │
+│  TickerHistory                                                               │
+│  ├── Historical EOD prices                                                  │
+│  ├── Populated by: sp_write_ticker_history_from_derived                    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+The Stored Procedures (Orchestration)
+┌────────────────────────────────────────┬───────────────────────────────────┬──────────────────────┐
+│               Procedure                │              Purpose              │      Frequency       │
+├────────────────────────────────────────┼───────────────────────────────────┼──────────────────────┤
+│ sp_refresh_tickers_with_holding_counts │ Rebuild universe                  │ Every 15 min         │
+├────────────────────────────────────────┼───────────────────────────────────┼──────────────────────┤
+│ sp_build_intraday_request_queue        │ Join universe + symbology → queue │ Every 15 min         │
+├────────────────────────────────────────┼───────────────────────────────────┼──────────────────────┤
+│ sp_get_due_intraday_requests           │ SELECT what's due now             │ Called by API caller │
+├────────────────────────────────────────┼───────────────────────────────────┼──────────────────────┤
+│ sp_mark_requests_fulfilled             │ UPDATE after API response         │ Called by API caller │
+├────────────────────────────────────────┼───────────────────────────────────┼──────────────────────┤
+│ sp_write_ticker_history_live           │ MERGE fulfillment + EOD → output  │ Every 1 min          │
+├────────────────────────────────────────┼───────────────────────────────────┼──────────────────────┤
+│ sp_write_ticker_history                │ MERGE derived → historical        │ Daily (after EOD)    │
+└────────────────────────────────────────┴───────────────────────────────────┴──────────────────────┘
+What Matters vs Implementation Details
+┌──────────────────────────────┬───────────────────────┐
+│     Matters (Data Layer)     │ Implementation Detail │
+├──────────────────────────────┼───────────────────────┤
+│ Table schemas                │ Python vs Java vs C#  │
+├──────────────────────────────┼───────────────────────┤
+│ Column definitions           │ HTTP library choice   │
+├──────────────────────────────┼───────────────────────┤
+│ Relationships between tables │ Deployment method     │
+├──────────────────────────────┼───────────────────────┤
+│ Stored procedure logic       │ Scheduling mechanism  │
+├──────────────────────────────┼───────────────────────┤
+│ Data flow                    │ Authentication method │
+└──────────────────────────────┴───────────────────────┘
+Should I focus on defining the DDL for these layers in the MCP's fds-modules/intraday/ddl/ directory?
+
+✻ Cooked for 47s
+
+❯ We want to spend more time on the total orchestration, which is why this MCP has expanded in scope.
+THE END GOAL = REPLACE ALL FIS ACTIONS REQUIRED IN SEC MASTER.   BUT!   That's
+not so fast!   1. We are going to lose some items for Sec Master's symbologyLookup workflows, while gaining others.  Not in scope for right now, just informing you that there is a
+whole "find or create ticker" workflow that we also have to bake into this process, which might help to tie to all this orchestration ...      or maybe it's totally in scope ...
+When we first see a ticker, we get the FactSet information, and that should trigger IMMEDIATE actions to populate whatever we can ...  there should be a VERY SIMPLE FactSet LATEST
+price, which will be FROM WHEREVER ...  that will make it much easier ...  we just update that table whenever we need to ...   And why, not, just save EACH TYPE explicitly....
+Vendors.fds_db_latest.fgp_prices_latest   ... and we'll have fgp_prices_latest_prior   ...   and then separately, we have a Standing Every 10 minutes Tickers list in
+vendors.fds.intraday_primary_tier_usd_equities with an equivalent _prior table, and vendors.fds.intraday_secondary_tier_usd_equities (with _prior) that we build from
+Vendors.fds.ticker_factset_price_coverage_summary ....   and separately, we make requests to intraday using the FactSet Snapshot API.   And theennnn ... we have all the time, the
+FactSet FGP workflow step functions running at all times, whether it's python or whatever, populating vendors.fds_api.snapshot_capture (with details like snapshot time) ... and I
+wonder if there is ANY point to storing their data?  Probably not, because it's limited to USD only. ;  SEPARATE QUESTION!  How easy / hard would it be to calculate a 1-year
+volatility for every security on the latest day, for a 1 year range?  ...   and finally, we also have the vendors.fds.prices_adjusted_derived, which is the ongoing INIT, TOPOFF,
+BACKFILL, FORCE_REFRESH, with refresh also embedded in topoff/backfill ...   from which we can probably calculate that volatility ...   and then last point is that right? whenever
+we see a brand new ticker, we can trigger a series of actions so that the Vendors.FDS data is always available.
+
+
+
+● Now I understand the full scope. Let me map this out:
+
+The Complete Orchestration Vision
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  END GOAL: REPLACE ALL FIS ACTIONS IN SEC MASTER                            │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│  FIS Today                          FactSet Tomorrow                         │
+│  ──────────                         ────────────────                         │
+│  Symbology lookup          →        FactSet symbology (fsym_id)             │
+│  Quote/price               →        FGP + Intraday Snapshot                 │
+│  Corporate actions         →        CA pipeline (already building)          │
+│  Exchange rates            →        FGP exchange rates                       │
+│  Ticker resolution         →        FactSet entity mapping                  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Data Layer Architecture (Explicit Tables)
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  LAYER: LATEST PRICES (Simple, Always Current)                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  vendors.fds_db_latest.fgp_prices_latest                                    │
+│  vendors.fds_db_latest.fgp_prices_latest_prior                              │
+│  ├── tickerID, fsym_id                                                      │
+│  ├── price, price_date, currency                                            │
+│  ├── source ('eod', 'intraday_primary', 'intraday_secondary')              │
+│  └── updated_at                                                              │
+│                                                                              │
+│  PURPOSE: The ONE table for "what's the latest price?"                      │
+│  UPDATED: Whenever ANY source has new data                                  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  LAYER: INTRADAY TIERS (Explicit by Refresh Frequency)                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  vendors.fds.intraday_primary_tier_usd_equities                             │
+│  vendors.fds.intraday_primary_tier_usd_equities_prior                       │
+│  ├── tickerID, ticker_exchange, fsym_id                                     │
+│  ├── countInstances (threshold for tier 1)                                  │
+│  ├── last_price, bid, ask, volume, trade_time                              │
+│  ├── last_requested, next_request_due                                       │
+│  └── Refresh: Every 10 minutes                                              │
+│                                                                              │
+│  vendors.fds.intraday_secondary_tier_usd_equities                           │
+│  vendors.fds.intraday_secondary_tier_usd_equities_prior                     │
+│  ├── (same schema)                                                          │
+│  └── Refresh: Every 60 minutes                                              │
+│                                                                              │
+│  SOURCE: Built from vendors.fds.ticker_factset_price_coverage_summary       │
+│  FILTER: fds_region_code = 'N', currency = 'USD'                           │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  LAYER: SNAPSHOT CAPTURE (API Response Storage - Maybe?)                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  vendors.fds_api.snapshot_capture                                            │
+│  ├── tickerID, ticker_exchange                                              │
+│  ├── snapshot_time, request_batch_id                                        │
+│  ├── raw_response (JSON?)                                                   │
+│  ├── parsed fields...                                                        │
+│                                                                              │
+│  QUESTION: Worth storing? Limited to USD only, pay-per-request.            │
+│  ANSWER: Maybe just for audit/debugging? Or skip entirely.                  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  LAYER: CA-ADJUSTED PRICES (FGP Pipeline Output)                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  vendors.fds.prices_adjusted_derived                                         │
+│  ├── tickerID, fsym_id, price_date                                          │
+│  ├── adjusted_price, adjustment_factor                                      │
+│  ├── volume, high, low, open, close                                         │
+│                                                                              │
+│  WORKFLOW: INIT → TOPOFF → BACKFILL → FORCE_REFRESH                        │
+│  (What we've been building in the FGP pipeline)                             │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  LAYER: DERIVED METRICS (Calculated from adjusted prices)                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  vendors.fds.ticker_volatility_1yr                                           │
+│  ├── tickerID, fsym_id                                                      │
+│  ├── volatility_1yr (annualized std dev of daily returns)                  │
+│  ├── calculation_date, price_count                                          │
+│  └── calculated_at                                                           │
+│                                                                              │
+│  CALCULATION: See below                                                      │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+New Ticker Trigger Flow
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  TRIGGER: NEW TICKER SEEN                                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  1. SecMaster sees new ticker (or client adds position)                     │
+│                      │                                                       │
+│                      ▼                                                       │
+│  2. Symbology lookup: Get fsym_id from FactSet                              │
+│                      │                                                       │
+│                      ▼                                                       │
+│  3. INSERT into vendors.fds.ticker_factset_price_coverage_summary           │
+│                      │                                                       │
+│                      ▼                                                       │
+│  4. TRIGGER: sp_init_new_ticker_fds_data                                    │
+│     ├── Queue for FGP price load (INIT for this ticker)                    │
+│     ├── Queue for CA events check                                           │
+│     ├── If USD + N region: Add to intraday tier                            │
+│     └── Immediately fetch latest price → fgp_prices_latest                  │
+│                      │                                                       │
+│                      ▼                                                       │
+│  5. Vendors.FDS data is IMMEDIATELY available                               │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+1-Year Volatility Calculation
+
+Question: How easy/hard to calculate?
+
+Answer: Pretty easy from prices_adjusted_derived:
+
+-- Calculate 1-year annualized volatility for each ticker
+-- Volatility = STDEV(daily_returns) * SQRT(252)
+
+WITH daily_returns AS (
+SELECT
+tickerID,
+fsym_id,
+price_date,
+adjusted_price,
+LAG(adjusted_price) OVER (PARTITION BY tickerID ORDER BY price_date) AS prev_price,
+LOG(adjusted_price / NULLIF(LAG(adjusted_price) OVER (PARTITION BY tickerID ORDER BY price_date), 0)) AS log_return
+FROM vendors.fds.prices_adjusted_derived
+WHERE price_date >= DATEADD(YEAR, -1, GETDATE())
+),
+volatility_calc AS (
+SELECT
+tickerID,
+fsym_id,
+COUNT(*) AS price_count,
+STDEV(log_return) AS daily_volatility,
+STDEV(log_return) * SQRT(252) AS annualized_volatility
+FROM daily_returns
+WHERE log_return IS NOT NULL
+GROUP BY tickerID, fsym_id
+HAVING COUNT(*) >= 200  -- Require ~200 trading days for meaningful calc
+)
+SELECT
+tickerID,
+fsym_id,
+annualized_volatility AS volatility_1yr,
+price_count,
+GETDATE() AS calculated_at
+FROM volatility_calc;
+
+Performance: For all tickers with 1-year history:
+- ~5,000 tickers × 252 days = 1.26M rows
+- Window function + aggregation = seconds (with proper indexing)
+- Run daily after EOD load
+
+The Complete Picture
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        FDS ORCHESTRATION LAYERS                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ALWAYS RUNNING:                                                             │
+│  ───────────────                                                             │
+│  • FGP Pipeline (INIT/TOPOFF/BACKFILL/FORCE_REFRESH)                        │
+│  • Intraday Snapshot requests (10min/60min tiers)                           │
+│  • Coverage summary refresh                                                  │
+│  • Volatility calculations (daily)                                          │
+│                                                                              │
+│  TRIGGERED:                                                                  │
+│  ──────────                                                                  │
+│  • New ticker → immediate FDS data population                               │
+│  • CA event detected → re-derive affected prices                            │
+│                                                                              │
+│  OUTPUT TABLES:                                                              │
+│  ──────────────                                                              │
+│  • fgp_prices_latest (+ _prior) ← THE simple "latest price"                │
+│  • intraday_primary_tier_usd_equities (+ _prior)                            │
+│  • intraday_secondary_tier_usd_equities (+ _prior)                          │
+│  • prices_adjusted_derived ← historical CA-adjusted                         │
+│  • ticker_volatility_1yr ← derived metric                                   │
+│                                                                              │
+│  CONSUMED BY:                                                                │
+│  ────────────                                                                │
+│  • TickerHistoryLive (current price)                                        │
+│  • TickerHistory (historical)                                               │
+│  • getQuote() ← now just reads, doesn't orchestrate                        │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Questions
+
+1. Snapshot capture table - Store or skip? (I lean toward skip - just write directly to tier tables)
+We always have the latest data stored ...  Every 10 minutes, between USD market hours, we snap this 15-minute delayed price:
+   vendors.fds.intraday_primary_tier_usd_equities    ... is the snapshot for tickers qualified as "primary tier"                
+   │  vendors.fds.intraday_primary_tier_usd_equities_prior  -->   what was in Equities before  ...  re-snapped every 10 minutes.
+
+   vendors.fds.intraday_secondary_tier_usd_equities    ... is the snapshot for tickers qualified as "primary tier"                
+   │  vendors.fds.intraday_secondary_tier_usd_equities_prior  -->   what was in Equities before  ...  re-snapped every 10 minutes.
+
+
+
+2. _prior pattern - Is this for audit trail or for change detection (delta processing)?
+
+No, and doesn't the MCP have details about these patterns?  Can we try to explain these orchestration constructs and declarations explicitly?
+How do we best define Data Governance? Entity Management? 
+
+The only Bronze data are those data sets that we don't derive.
+
+But we build MANY silver layers, some as upstream, acting as inputs or drivers of activity.
+
+Bronze:
+* Coverage Summary (maybe this is silver?)
+* FactSet source tables
+
+
+Silver:
+Every table has a regular and _prior ...  so that prior can go to a data lake as needed ... and the regular to _prior is either a copy all and then truncate and rebuild
+  or it's a delete from _prior per entity, then copy PER entity, e.g. tickerID or fsymID into _prior 
+  and then delete from regular and write new data into regular ... 
+* Intraday Ticker Universe --> Always reflects what's in Coverage Summary, and is subject to change throughout the day during client activity
+  * Always builds the 10 minute and 60 minute batches
+  * WE SHOULD HAVE SOME PRICE MONITORING ...  and record every ticker that gets requested and the frequency.
+    * Goal = record the number of ticks and attribute a cost
+    * Try to find the clients with these tickers and see the best way of monitoring costs
+* Latest Prices from fds.fgp_v1.fgp_prices -->  Per ticker ID, a simple grab of each fsym_ID's latest
+* EOD Adjusted Prices
+* CA Event Details with factors and dividend info
+
+3. Volatility - Daily calculation, or on-demand?
+   We eventually want it for all dates historically, but we start with the latest day ... then we add in new data every day
+4. New ticker trigger - Database trigger, or application-level event?
+We have an upcoming "Find or Create Ticker" system, which will either find what's existing or create a new one.
+When it creates a new one, we can immediately set of events.
+
+
+● Excellent - the MCP already has the Medallion Architecture documented with the _prior pattern. Now let me propose expanding this to include the full orchestration scope you described.
+
+What the MCP Already Has (FGP Pipeline)
+
+✅ Bronze → Silver → Gold layers
+✅ _prior archive pattern
+✅ INIT / TOPOFF / BACKFILL / REFRESH workflow modes
+✅ Identity management (fsym_id ↔ tickerID)
+✅ Batch processing flow
+✅ Data governance (traceability, auditability)
+
+What We Need to Add
+
+Let me create a comprehensive DATA_ORCHESTRATION_REFERENCE.md that expands the scope:
+
+
+
+│  Purpose: Track every intraday API request and attribute costs                          │
+│                                                                                          │
+│  Table: vendors.fds.intraday_request_log                                                │
+│  ┌────────────────────────────────────────────────────────────────────────────────┐    │
+│  │  request_id         UNIQUEIDENTIFIER PRIMARY KEY                               │    │
+│  │  request_batch_id   UNIQUEIDENTIFIER          -- Group of requests            │    │
+│  │  request_time       DATETIME2                 -- When requested               │    │
+│  │  ticker_count       INT                       -- Tickers in batch             │    │
+│  │  tier               VARCHAR(20)               -- 'primary' or 'secondary'     │    │
+│  │  estimated_cost     DECIMAL(10,4)             -- Cost per request             │    │
+│  │  response_time_ms   INT                       -- API response time            │    │
+│  │  success            BIT                       -- Did request succeed?    
+
+● Now for skills. Let me check how the existing skills are configured in your project:
+
+● Bash(find /mnt/c/Users/dzalika/IdeaProjects -name "*skill*" -o -name ".claude" 2>/dev/null | head -20)
+⎿  Running in the background (↓ to manage)
+
+● Task Output b8f1990
+⎿  (No content)
+
+● Bash(ls -la /mnt/c/Users/dzalika/IdeaProjects/dptv2/.claude/ 2>/dev/null || echo "No .claude directory"; ls /mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-m…)
+⎿  total 1
+drwxrwxrwx 1 root root 512 Jan 12 20:14 .
+drwxrwxrwx 1 root root 512 Jan 10 20:37 ..
+… +5 lines (ctrl+o to expand)
+
+● Bash(ls -la /mnt/c/Users/dzalika/IdeaProjects/dptv2/.claude/commands/)
+⎿  total 8
+drwxrwxrwx 1 root root  512 Sep 12 14:31 .
+drwxrwxrwx 1 root root  512 Jan 12 20:14 ..
+… +2 lines (ctrl+o to expand)
+
+● Read(.claude/settings.local.json)
+⎿  Read 24 lines
+
+● Read(.claude/commands/create-jira-task.md)
+⎿  Read 24 lines
+
+● Now I understand. Let me create skills for the FDS MCP:
+
+● Bash(mkdir -p /mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/.claude/commands)
+⎿  (No content)
+
+● Write(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/.claude/commands/generate-ddl.md)
+⎿  Wrote 34 lines to ../fds-fgp-orchestration-mcp/.claude/commands/generate-ddl.md
+# Generate DDL
+**Usage:** `/generate-ddl <entity_name>`
+**Description:** Generates complete SQL Server DDL for an entity including CREATE TABLE, indexes, and _prior companion table. Follows established SQL conventions from
+sql/fds_v5/.
+**Example:**
+```
+/generate-ddl ca_events_translated
+/generate-ddl intraday_primary_tier_usd_equities
+… +24 lines (ctrl+o to expand)
+
+● Write(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/.claude/commands/list-entities.md)
+⎿  Wrote 31 lines to ../fds-fgp-orchestration-mcp/.claude/commands/list-entities.md
+# List Entities
+**Usage:** `/list-entities [domain]`
+**Description:** Lists all registered data entities, optionally filtered by domain.
+**Examples:**
+```
+/list-entities              # List all entities
+/list-entities ca           # List CA pipeline entities
+… +21 lines (ctrl+o to expand)
+
+● Write(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/.claude/commands/deploy-domain.md)
+⎿  Wrote 39 lines to ../fds-fgp-orchestration-mcp/.claude/commands/deploy-domain.md
+# Deploy Domain DDL
+**Usage:** `/deploy-domain <domain>`
+**Description:** Generates complete, deployable SQL Server DDL for all entities in a domain. Use this to set up an entire feature area at once.
+**Examples:**
+```
+/deploy-domain ca           # All CA pipeline tables
+/deploy-domain intraday     # All intraday tier tables
+… +29 lines (ctrl+o to expand)
+
+● Write(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/.claude/commands/add-entity.md)
+⎿  Wrote 43 lines to ../fds-fgp-orchestration-mcp/.claude/commands/add-entity.md
+# Add Entity
+**Usage:** `/add-entity <name> <domain>`
+**Description:** Interactive wizard to add a new entity definition to the catalog. Claude will guide you through defining columns, constraints, and indexes.
+**Examples:**
+```
+/add-entity ticker_fx_rates prices
+/add-entity intraday_europe_equities intraday
+… +33 lines (ctrl+o to expand)
+
+● Write(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/.claude/commands/recover.md)
+⎿  Wrote 35 lines to ../fds-fgp-orchestration-mcp/.claude/commands/recover.md
+# Recover Context
+**Usage:** `/recover`
+**Description:** Use this after context compaction to quickly restore project awareness. Reads CLAUDE_RECOVERY.md and calls project state tools.
+**Example:**
+```
+/recover
+```
+… +25 lines (ctrl+o to expand)
+
+● Done. Here's what was created:
+
+NEW MCP TOOLS (in server.py):
+┌─────────────────────────┬──────────────────────────────────────────┐
+│          Tool           │                 Purpose                  │
+├─────────────────────────┼──────────────────────────────────────────┤
+│ fds_generate_full_ddl   │ Complete DDL with indexes + _prior table │
+├─────────────────────────┼──────────────────────────────────────────┤
+│ fds_list_by_domain      │ Filter entities by domain                │
+├─────────────────────────┼──────────────────────────────────────────┤
+│ fds_list_by_vendor      │ Filter entities by vendor                │
+├─────────────────────────┼──────────────────────────────────────────┤
+│ fds_generate_domain_ddl │ Generate all DDL for a domain            │
+├─────────────────────────┼──────────────────────────────────────────┤
+│ fds_entity_summary      │ Summary by vendor/domain                 │
+└─────────────────────────┴──────────────────────────────────────────┘
+NEW SKILLS (in .claude/commands/):
+┌────────────────┬────────────────────────────────────┬─────────────────────────────────────┐
+│     Skill      │               Usage                │               Purpose               │
+├────────────────┼────────────────────────────────────┼─────────────────────────────────────┤
+│ /generate-ddl  │ /generate-ddl ca_events_translated │ Generate DDL for one entity         │
+├────────────────┼────────────────────────────────────┼─────────────────────────────────────┤
+│ /list-entities │ /list-entities [domain]            │ List entities, optionally by domain │
+├────────────────┼────────────────────────────────────┼─────────────────────────────────────┤
+│ /deploy-domain │ /deploy-domain intraday            │ Generate all DDL for a domain       │
+├────────────────┼────────────────────────────────────┼─────────────────────────────────────┤
+│ /add-entity    │ /add-entity ticker_fx_rates prices │ Wizard to add new entity            │
+├────────────────┼────────────────────────────────────┼─────────────────────────────────────┤
+│ /recover       │ /recover                           │ Restore context after compaction    │
+└────────────────┴────────────────────────────────────┴─────────────────────────────────────┘
+File Structure Created:
+fds-fgp-orchestration-mcp/
+├── src/
+│   ├── entities/           # Package (NEW)
+│   │   ├── base.py         # Base classes + registry
+│   │   └── fds/            # FactSet entities
+│   │       ├── ca.py
+│   │       ├── prices.py
+│   │       ├── intraday.py
+│   │       └── monitoring.py
+│   ├── ddl_generator.py    # SQL translation (NEW)
+│   └── server.py           # +5 new tools
+├── .claude/
+│   └── commands/           # Skills (NEW)
+│       ├── generate-ddl.md
+│       ├── list-entities.md
+│       ├── deploy-domain.md
+│       ├── add-entity.md
+│       └── recover.md
+└── CLAUDE_RECOVERY.md      # Recovery doc
+
+The MCP now has both atomic tools (for programmatic access) and high-level skills (for interactive workflows).
+
+✻ Baked for 5m 53s
+
+● Background command "Find skill configs" completed (exit code 0).
+
+● Read agent output b8f1990
+⎿  Read 11 lines
+
+● The background search confirms the .claude directory was created for fds-fgp-orchestration-mcp.
+
+Summary of today's work:
+┌───────────┬─────────────────────────────────────────────────────────┐
+│   Layer   │                     What was built                      │
+├───────────┼─────────────────────────────────────────────────────────┤
+│ Data      │ entities/ package with 19 FDS entities across 4 domains │
+├───────────┼─────────────────────────────────────────────────────────┤
+│ Generator │ ddl_generator.py - translates entities → SQL Server DDL │
+├───────────┼─────────────────────────────────────────────────────────┤
+│ Tools     │ 5 new MCP tools for DDL generation and entity queries   │
+├───────────┼─────────────────────────────────────────────────────────┤
+│ Skills    │ 5 slash commands (/generate-ddl, /deploy-domain, etc.)  │
+├───────────┼─────────────────────────────────────────────────────────┤
+│ Recovery  │ CLAUDE_RECOVERY.md + /recover skill                     │
+└───────────┴─────────────────────────────────────────────────────────┘
+Ready to use:
+/list-entities intraday     # See intraday entities
+/generate-ddl intraday_primary_tier_usd_equities  # Get DDL
+/deploy-domain intraday     # All intraday DDL at once
+
+What would you like to do next?
+
+❯ can you show me the ddls now?  Is there any place where we can start to produce the DDLs for use with the project, and actually SAVE what we generate in .sql files, appropriately
+cataloged in this project?
+
+● Let me create a proper DDL directory structure and generate the files:
+
+● Bash(mkdir -p /mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/ddl/fds/{ca,prices,intraday,monitoring,universe})
+⎿  (No content)
+
+● Write(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/ddl/generate_all.py)
+⎿  Wrote 76 lines to ../fds-fgp-orchestration-mcp/ddl/generate_all.py
+#!/usr/bin/env python3
+"""
+Generate all DDL files from entity definitions.
+Usage:
+cd fds-fgp-orchestration-mcp
+uv run python ddl/generate_all.py
+Output:
+ddl/fds/ca/*.sql
+… +66 lines (ctrl+o to expand)
+
+▐▛███▜▌   Claude Code v2.1.2
+▝▜█████▛▘  Opus 4.5 · Claude Team
+▘▘ ▝▝    /mnt/c/Users/dzalika/IdeaProjects/dptv2
+════════════════════════════════════════════════════════════════════════ Conversation compacted · ctrl+o for history ═══════════════════════════════════════════════════════════════════════
+⎿  Read ../fds-fgp-orchestration-mcp/ddl/generate_all.py (76 lines)
+⎿  Read ../fds-fgp-orchestration-mcp/.claude/commands/recover.md (35 lines)
+⎿  Read ../fds-fgp-orchestration-mcp/.claude/commands/add-entity.md (43 lines)
+⎿  Read ../fds-fgp-orchestration-mcp/.claude/commands/deploy-domain.md (39 lines)
+⎿  Read ../fds-fgp-orchestration-mcp/.claude/commands/list-entities.md (31 lines)
+
+● I'll continue generating the DDL files for the fds-fgp-orchestration-mcp project. Let me first read the entity definitions to generate the actual .sql files.
+
+● Read(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/src/entities/fds/ca.py)
+⎿  Read 289 lines
+
+● Read(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/src/entities/fds/prices.py)
+⎿  Read 217 lines
+
+● Read(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/src/entities/fds/intraday.py)
+⎿  Read 216 lines
+
+● Read(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/src/entities/fds/monitoring.py)
+⎿  Read 220 lines
+
+● Read(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/src/ddl_generator.py)
+⎿  Read 353 lines
+
+● Let me also read the base.py to get the Schema enum values.
+
+● Read(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/src/entities/base.py)
+⎿  Read 177 lines
+
+● Now I'll generate the DDL files. Let me create the directory structure and generate individual SQL files for each entity, plus domain deployment files.
+
+● Bash(mkdir -p /mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/ddl/fds/ca /mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/ddl/fds/prices /mnt/…)
+⎿  (No content)
+
+● Write(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/ddl/fds/ca/ca_pipeline_queue.sql)
+⎿  Wrote 78 lines to ../fds-fgp-orchestration-mcp/ddl/fds/ca/ca_pipeline_queue.sql
+/*============================================================
+Table: ca_pipeline_queue
+Schema: fds_tracking
+Purpose: Queue management for batch processing
+Generated: 2026-01-13
+Source: entities/fds/ca.py
+============================================================*/
+… +68 lines (ctrl+o to expand)
+
+● Write(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/ddl/fds/ca/fsym_ca_status.sql)
+⎿  Wrote 58 lines to ../fds-fgp-orchestration-mcp/ddl/fds/ca/fsym_ca_status.sql
+/*============================================================
+Table: fsym_ca_status
+Schema: fds_tracking
+Purpose: Track which securities have been processed and when
+Generated: 2026-01-13
+Source: entities/fds/ca.py
+============================================================*/
+… +48 lines (ctrl+o to expand)
+
+● Write(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/ddl/fds/ca/ca_batch_summary.sql)
+⎿  Wrote 61 lines to ../fds-fgp-orchestration-mcp/ddl/fds/ca/ca_batch_summary.sql
+/*============================================================
+Table: ca_batch_summary
+Schema: fds_tracking
+Purpose: Track overall batch progress and timing
+Generated: 2026-01-13
+Source: entities/fds/ca.py
+============================================================*/
+… +51 lines (ctrl+o to expand)
+
+● Write(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/ddl/fds/ca/ca_events_translated.sql)
+⎿  Wrote 134 lines to ../fds-fgp-orchestration-mcp/ddl/fds/ca/ca_events_translated.sql
+/*============================================================
+Table: ca_events_translated
+Schema: fds
+Purpose: Level 1 output - translate raw events to factors
+Generated: 2026-01-13
+Source: entities/fds/ca.py
+============================================================*/
+… +124 lines (ctrl+o to expand)
+
+● Write(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/ddl/fds/ca/ca_daily_factors.sql)
+⎿  Wrote 99 lines to ../fds-fgp-orchestration-mcp/ddl/fds/ca/ca_daily_factors.sql
+/*============================================================
+Table: ca_daily_factors
+Schema: fds
+Purpose: Level 2 output - aggregate multiple events per day
+Generated: 2026-01-13
+Source: entities/fds/ca.py
+============================================================*/
+… +89 lines (ctrl+o to expand)
+
+● Write(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/ddl/fds/ca/ca_cumulative_factors.sql)
+⎿  Wrote 93 lines to ../fds-fgp-orchestration-mcp/ddl/fds/ca/ca_cumulative_factors.sql
+/*============================================================
+Table: ca_cumulative_factors
+Schema: fds
+Purpose: Level 3 output - cumulative adjustment for historical prices
+Generated: 2026-01-13
+Source: entities/fds/ca.py
+============================================================*/
+… +83 lines (ctrl+o to expand)
+
+● Write(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/ddl/fds/universe/ticker_factset_price_coverage_summary.sql)
+⎿  Wrote 87 lines to ../fds-fgp-orchestration-mcp/ddl/fds/universe/ticker_factset_price_coverage_summary.sql
+/*============================================================
+Table: ticker_factset_price_coverage_summary
+Schema: fds
+Purpose: THE BRIDGE: tickerID (our system) <-> fsymID (FactSet)
+Generated: 2026-01-13
+Source: entities/fds/prices.py
+============================================================*/
+… +77 lines (ctrl+o to expand)
+
+● Write(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/ddl/fds/prices/factset_prices_adjusted_derived.sql)
+⎿  Wrote 155 lines to ../fds-fgp-orchestration-mcp/ddl/fds/prices/factset_prices_adjusted_derived.sql
+/*============================================================
+Table: factset_prices_adjusted_derived
+Schema: fds
+Purpose: Layer 4 output - adjusted historical prices, synced to TickerHistory
+Generated: 2026-01-13
+Source: entities/fds/prices.py
+============================================================*/
+… +145 lines (ctrl+o to expand)
+
+● Write(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/ddl/fds/prices/fgp_prices_latest.sql)
+⎿  Wrote 136 lines to ../fds-fgp-orchestration-mcp/ddl/fds/prices/fgp_prices_latest.sql
+/*============================================================
+Table: fgp_prices_latest
+Schema: fds
+Purpose: Single source of truth for current prices
+Generated: 2026-01-13
+Source: entities/fds/prices.py
+============================================================*/
+… +126 lines (ctrl+o to expand)
+
+● Write(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/ddl/fds/intraday/intraday_primary_tier_usd_equities.sql)
+⎿  Wrote 153 lines to ../fds-fgp-orchestration-mcp/ddl/fds/intraday/intraday_primary_tier_usd_equities.sql
+/*============================================================
+Table: intraday_primary_tier_usd_equities
+Schema: fds
+Purpose: Cache intraday prices for most-watched securities
+10-minute refresh tier for high-traffic USD equities
+countInstances >= 100 → PRIMARY tier
+Generated: 2026-01-13
+… +143 lines (ctrl+o to expand)
+
+● Write(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/ddl/fds/intraday/intraday_secondary_tier_usd_equities.sql)
+⎿  Wrote 145 lines to ../fds-fgp-orchestration-mcp/ddl/fds/intraday/intraday_secondary_tier_usd_equities.sql
+/*============================================================
+Table: intraday_secondary_tier_usd_equities
+Schema: fds
+Purpose: Cache intraday prices with reduced API cost
+60-minute refresh tier for lower-traffic USD equities
+countInstances >= 10 → SECONDARY tier
+Generated: 2026-01-13
+… +135 lines (ctrl+o to expand)
+
+● Write(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/ddl/fds/intraday/intraday_tier_assignments.sql)
+⎿  Wrote 82 lines to ../fds-fgp-orchestration-mcp/ddl/fds/intraday/intraday_tier_assignments.sql
+/*============================================================
+Table: intraday_tier_assignments
+Schema: fds
+Purpose: Audit trail for tier changes
+Tracks tier assignments with history and reasoning.
+When a ticker moves between tiers, the old record is marked
+is_current=0 and superseded_at is set.
+… +72 lines (ctrl+o to expand)
+
+● Write(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/ddl/fds/monitoring/intraday_request_log.sql)
+⎿  Wrote 96 lines to ../fds-fgp-orchestration-mcp/ddl/fds/monitoring/intraday_request_log.sql
+/*============================================================
+Table: intraday_request_log
+Schema: fds
+Purpose: Track cost per batch, response times, error rates
+Batch-level request tracking for FactSet Snapshot API.
+Each row represents one API call to the Snapshot API.
+Generated: 2026-01-13
+… +86 lines (ctrl+o to expand)
+
+● Write(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/ddl/fds/monitoring/intraday_ticker_request_detail.sql)
+⎿  Wrote 91 lines to ../fds-fgp-orchestration-mcp/ddl/fds/monitoring/intraday_ticker_request_detail.sql
+/*============================================================
+Table: intraday_ticker_request_detail
+Schema: fds
+Purpose: Link requests to client holdings for fair cost sharing
+Ticker-level request details for cost attribution.
+Each row represents one ticker in one API request.
+Generated: 2026-01-13
+… +81 lines (ctrl+o to expand)
+
+● Write(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/ddl/fds/monitoring/intraday_cost_daily_summary.sql)
+⎿  Wrote 87 lines to ../fds-fgp-orchestration-mcp/ddl/fds/monitoring/intraday_cost_daily_summary.sql
+/*============================================================
+Table: intraday_cost_daily_summary
+Schema: fds
+Purpose: Track total costs, efficiency, and trends over time
+Daily aggregated cost metrics.
+One row per day with rolled-up statistics.
+Generated: 2026-01-13
+… +77 lines (ctrl+o to expand)
+
+● Write(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/ddl/fds/monitoring/intraday_client_cost_allocation.sql)
+⎿  Wrote 87 lines to ../fds-fgp-orchestration-mcp/ddl/fds/monitoring/intraday_client_cost_allocation.sql
+/*============================================================
+Table: intraday_client_cost_allocation
+Schema: fds
+Purpose: Fair cost sharing based on client holdings
+Per-client cost attribution for intraday API usage.
+Allocates daily costs across clients based on their holdings.
+Allocation methods:
+… +77 lines (ctrl+o to expand)
+
+● Write(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/ddl/fds/00_deploy_ca.sql)
+⎿  Wrote 375 lines to ../fds-fgp-orchestration-mcp/ddl/fds/00_deploy_ca.sql
+/*============================================================
+DOMAIN DEPLOYMENT: Corporate Actions (CA)
+============================================================
+Entities: 6 (+ _prior tables)
+Schemas: fds_tracking, fds
+Deployment Order:
+1. fds_tracking.ca_pipeline_queue   - Work queue
+2. fds_tracking.fsym_ca_status      - Per-security tracking
+… +365 lines (ctrl+o to expand)
+
+● Write(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/ddl/fds/00_deploy_intraday.sql)
+⎿  Wrote 276 lines to ../fds-fgp-orchestration-mcp/ddl/fds/00_deploy_intraday.sql
+/*============================================================
+DOMAIN DEPLOYMENT: Intraday Pricing
+============================================================
+Entities: 3 (+ _prior tables)
+Schema: fds
+Deployment Order:
+1. fds.intraday_primary_tier_usd_equities    - 10-min refresh
+2. fds.intraday_secondary_tier_usd_equities  - 60-min refresh
+… +266 lines (ctrl+o to expand)
+
+● Write(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/ddl/fds/00_deploy_monitoring.sql)
+⎿  Wrote 216 lines to ../fds-fgp-orchestration-mcp/ddl/fds/00_deploy_monitoring.sql
+/*============================================================
+DOMAIN DEPLOYMENT: Cost Monitoring
+============================================================
+Entities: 4
+Schema: fds
+Deployment Order:
+1. fds.intraday_request_log           - Batch-level request tracking
+2. fds.intraday_ticker_request_detail - Ticker-level details
+… +206 lines (ctrl+o to expand)
+
+● Write(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/ddl/fds/00_deploy_prices.sql)
+⎿  Wrote 303 lines to ../fds-fgp-orchestration-mcp/ddl/fds/00_deploy_prices.sql
+/*============================================================
+DOMAIN DEPLOYMENT: Prices and Universe
+============================================================
+Entities: 3 (+ _prior tables)
+Schema: fds
+Deployment Order:
+1. fds.ticker_factset_price_coverage_summary  - Bridge table
+2. fds.factset_prices_adjusted_derived        - CA-adjusted prices
+… +293 lines (ctrl+o to expand)
+
+● Bash(find /mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/ddl -name "*.sql" -type f | sort)
+⎿  /mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/ddl/fds/00_deploy_ca.sql
+/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/ddl/fds/00_deploy_intraday.sql
+/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/ddl/fds/00_deploy_monitoring.sql
+… +17 lines (ctrl+o to expand)
+
+● DDL files have been generated and saved to the fds-fgp-orchestration-mcp project. Here's what was created:
+
+Generated DDL Structure
+
+ddl/fds/
+├── 00_deploy_ca.sql              # Combined CA domain deployment
+├── 00_deploy_intraday.sql        # Combined Intraday deployment
+├── 00_deploy_monitoring.sql      # Combined Monitoring deployment
+├── 00_deploy_prices.sql          # Combined Prices/Universe deployment
+│
+├── ca/                           # Individual CA entity files
+│   ├── ca_batch_summary.sql
+│   ├── ca_cumulative_factors.sql
+│   ├── ca_daily_factors.sql
+│   ├── ca_events_translated.sql
+│   ├── ca_pipeline_queue.sql
+│   └── fsym_ca_status.sql
+│
+├── intraday/                     # Individual Intraday entity files
+│   ├── intraday_primary_tier_usd_equities.sql
+│   ├── intraday_secondary_tier_usd_equities.sql
+│   └── intraday_tier_assignments.sql
+│
+├── monitoring/                   # Individual Monitoring entity files
+│   ├── intraday_client_cost_allocation.sql
+│   ├── intraday_cost_daily_summary.sql
+│   ├── intraday_request_log.sql
+│   └── intraday_ticker_request_detail.sql
+│
+├── prices/                       # Individual Price entity files
+│   ├── factset_prices_adjusted_derived.sql
+│   └── fgp_prices_latest.sql
+│
+└── universe/                     # Bridge table
+└── ticker_factset_price_coverage_summary.sql
+
+Total: 20 SQL files
+┌────────────┬──────────┬────────┬───────────────┐
+│   Domain   │ Entities │ Tables │ _prior Tables │
+├────────────┼──────────┼────────┼───────────────┤
+│ CA         │ 6        │ 6      │ 3             │
+├────────────┼──────────┼────────┼───────────────┤
+│ Prices     │ 3        │ 3      │ 3             │
+├────────────┼──────────┼────────┼───────────────┤
+│ Intraday   │ 3        │ 3      │ 2             │
+├────────────┼──────────┼────────┼───────────────┤
+│ Monitoring │ 4        │ 4      │ 0             │
+└────────────┴──────────┴────────┴───────────────┘
+All DDL follows SQL Server conventions:
+- Schema existence checks before creation
+- Table existence checks (idempotent)
+- PK_, IX_, UQ_ naming conventions
+- DATETIME2(3) with SYSDATETIME() for timestamps
+- _prior companion tables with archived_at column

@@ -1,3 +1,54 @@
+
+As of Tuesday, 1/13/2026  ....
+This week's status and vision.
+
+
+1. FactSet Ticker Pricing orchestration
+
+Much progress has been made on the FactSet ticker pricing orchestration system. 
+
+What is it? Why do we need it? What are the outputs? 
+
+
+
+
+
+
+
+The new, new roadmap for replacing FIS completely, with minimal systematic new features:
+Turning off FIS means no more SEDOLs
+This does degrade data, the clock will be "ticking"
+It doesn't stop using CLIENT sedols, but it does mean that we will have to match specifically on bloomberg composite ticker and figure out how to de-duplicate
+Pricing. (includes corporate actions and FX)
+Requirement: Orchestration of SQL.
+Role. Replace FIS as a data provider
+Missing functionality:
+Request ticker WITH Quote
+Involves calls to database tables instead of APIs
+Ideally, logic can be separate from Sec Master
+Choices include direct SQL but for Ticker requires an API with orchestration
+Specific Milestone
+Running new Sec Master vs new data
+We need to have a way of running sec master
+Fastest way is by just replacing SelectfeedServices with FactSetServices, without leaving any control to toggle
+Review parity with selectfeed services methods
+Find or Create Ticker.
+Requirement for DPTv2. Simply to find the best ticker based on incoming TickerID
+Use Ticker as a service
+Decide when to CHANGE the ticker name vs. JTIC standard
+
+
+
+
+
+
+
+
+
+
+-----------
+
+
 Working on MCPs  
 
 Your claude_desktop_config.json already has 8 MCPs configured:
