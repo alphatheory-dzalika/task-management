@@ -5016,3 +5016,187 @@ All DDL follows SQL Server conventions:
 - PK_, IX_, UQ_ naming conventions
 - DATETIME2(3) with SYSDATETIME() for timestamps
 - _prior companion tables with archived_at column
+
+
+
+
+
+
+1. Workflow Types:
+   - INIT: Tickers with NO data
+   - TOPOFF: Tickers WITH data AND gap exists (max_price_date < @end_date)
+   - BACKFILL: Tickers WITH data AND @start_date < min(existing)
+2. CA Change Detection:
+   - Compares current ticker_factset_coverage_summary with _prior table
+   - Checks max_adjustment_date and avg_adjustment_factor
+   - If CA changed → triggers REFRESH instead of TOPOFF/BACKFILL
+3. fsymID Selection Logic:
+   CASE WHEN countRegionalPrices > 0 THEN fsymID ELSE fsymIdExchangeLevel END
+   - Uses REGIONAL if available, otherwise LISTING
+4. Smart Date Ranges:
+   - INIT: @start_date to @end_date
+   - TOPOFF: max_price_date + 1 to @end_date
+   - TOPOFF with CA change: min_price_date to @end_date (REFRESH preserves history start)
+   - BACKFILL: @start_date to min_price_date - 1
+5. Skip Logic:
+   - Only skips if previous run had rows_loaded > 0
+   - Respects @rerun_hours cutoff
+   - force_ticker_id bypasses skip
+6. Priority Ordering:
+   - priority ASC (Active Equity → Ideas → Option Underlier)
+   - countInstances DESC
+   - maxScenarioModified DESC
+7. The _prior Pattern:
+   - Uses ticker_factset_coverage_summary_prior for CA change detection
+   - Gracefully handles empty _prior table
+
+This is sophisticated orchestration logic. The CA change detection using the _prior table pattern is elegant - it allows detecting when FactSet's adjustment factors changed without tracking individual CA events.
+
+Let me summarize and show the complete picture.
+
+
+sp_queue_fds_price_loads - The Brain
+
+This is the sophisticated part - determines what to load and how.
+
+QUEUING LOGIC
+│
+├── Build ticker_status CTE:
+│   ├── FROM ticker_factset_coverage_summary cs
+│   ├── LEFT JOIN _prior (for CA change detection)
+│   ├── OUTER APPLY existing prices stats
+│   └── OUTER APPLY recent activity (rows_loaded > 0)
+│
+├── Classify by workflow:
+│   ├── INIT: price_count = 0
+│   ├── TOPOFF: price_count > 0 AND max_price_date < @end_date
+│   └── BACKFILL: price_count > 0 AND @start_date < min_price_date
+│
+├── CA Change Detection:
+│   └── If max_adjustment_date OR avg_adjustment_factor changed → REFRESH
+│
+└── INSERT into fds_price_load_activity (QUEUED or SKIP)
+
+The clever bits:
+┌─────────────────────┬──────────────────────────────────────────────────────────────────────────────────────┐
+│       Feature       │                                    Implementation                                    │
+├─────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+│ fsymID selection    │ CASE WHEN countRegionalPrices > 0 THEN fsymID ELSE fsymIdExchangeLevel END           │
+├─────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+│ CA change detection │ Compare current vs _prior on max_adjustment_date, avg_adjustment_factor              │
+├─────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+│ Smart date ranges   │ TOPOFF: max_price_date + 1 to @end_date; BACKFILL: @start_date to min_price_date - 1 │
+├─────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+│ Skip logic          │ Only skip if rows_loaded > 0 within @rerun_hours                                     │
+└─────────────────────┴──────────────────────────────────────────────────────────────────────────────────────┘
+The _prior pattern in action:
+CASE
+WHEN csp.tickerID IS NULL THEN 0  -- No prior = not changed
+WHEN cs.max_adjustment_date != csp.max_adjustment_date
+OR cs.avg_adjustment_factor != csp.avg_adjustment_factor
+THEN 1 ELSE 0
+END AS ca_changed
+
+Complete Pipeline Picture:
+
+sp_orchestrate_fds_price_load (ENTRY)
+│
+├─► sp_queue_fds_price_loads (BRAIN)
+│       ├── Reads: ticker_factset_coverage_summary + _prior
+│       ├── Detects: CA changes, existing data gaps
+│       └── Writes: fds_price_load_activity (QUEUED)
+│
+└─► sp_process_fds_price_queue (WORKER)
+│
+└─► sp_load_fds_ticker_prices (WORKHORSE) × N
+├── Reads: fgp_v1.fgp_global_prices
+├── Applies: fgp_v1.fgp_ca_adj_factors
+└── Writes: factset_prices_adjusted_derived
+
+Key difference from our CA pipeline design:
+- This uses FactSet's pre-calculated fgp_ca_adj_factors
+- Our design calculates factors from raw fgp_ca_events (Level1→Level2→Level3)
+- Both approaches are valid - this is simpler, ours gives more control/auditability
+
+Want me to document this as a reference in the project?
+
+❯ Please save ALL details ...  the simplified expectation of what to do next is that we want to layer IN the full CA events into this, because this system did work rather well and was
+fast, and I haven't yet gotten the other system to work from start to finish.
+
+● Write(/mnt/c/Users/dzalika/IdeaProjects/fds-fgp-orchestration-mcp/docs/PRICE_ORCHESTRATION_PRODUCTION_REFERENCE.md)
+⎿ Tool use rejected with user message: this is great, perfect, just to clarify, the reason why we can't trust the fgp_ca_adj_factors is that there is a bug in the factset product that
+we're working out with FactSet. But the ca_events themselves are fine.
+
+● Got it - that's critical context. Let me update the document with that.
+
+✻ Documenting production price orchestration system… (esc to interrupt · ctrl+t to hide todos · 2m 54s · ↓ 9.3k tokens · thought for 3s)
+⎿  ☐ Document production price orchestration system
+☐ Capture integration strategy for full CA pipeline
+
+-------------
+
+
+
+
+
+● Excellent find. THCalc has many more calculations than just 1-year volatility:
+
+THCalc Calculations Summary
+
+Volatility (4 windows)
+┌─────────────────┬──────────┬──────────────────────────┐
+│     Metric      │  Window  │         Formula          │
+├─────────────────┼──────────┼──────────────────────────┤
+│ Volatility_1M   │ 21 days  │ sqrt(variance × n) × 100 │
+├─────────────────┼──────────┼──────────────────────────┤
+│ Volatility_3M   │ 63 days  │ sqrt(variance × n) × 100 │
+├─────────────────┼──────────┼──────────────────────────┤
+│ Volatility_6M   │ 126 days │ sqrt(variance × n) × 100 │
+├─────────────────┼──────────┼──────────────────────────┤
+│ Volatility (1Y) │ 252 days │ sqrt(variance × n) × 100 │
+└─────────────────┴──────────┴──────────────────────────┘
+ADV (5 windows)
+┌───────────────────┬──────────────┐
+│      Metric       │ Trading Days │
+├───────────────────┼──────────────┤
+│ AvgDailyVolume30  │ 21           │
+├───────────────────┼──────────────┤
+│ AvgDailyVolume60  │ 42           │
+├───────────────────┼──────────────┤
+│ AvgDailyVolume    │ 63           │
+├───────────────────┼──────────────┤
+│ AvgDailyVolume180 │ 126          │
+├───────────────────┼──────────────┤
+│ AvgDailyVolume360 │ 249          │
+└───────────────────┴──────────────┘
+Beta & Correlation (3-year lookback)
+
+- RawBeta: cov(ticker, benchmark) / var(benchmark)
+- Correlation: Pearson correlation
+- ATBeta: Adjusted beta formula
+
+SMAs (6 windows)
+
+25, 50, 100, 150, 200, 250 day
+
+High/Low
+
+- 52-week high/low
+- 12-week high/low
+
+Historical Prices
+
+1W, 4W, 12W, 52W, YTD beginning
+
+Dividends
+
+- IAD (Indicated Annual Dividend)
+- Yield
+
+  ---
+Formula Note: THCalc uses sqrt(variance × n) × 100 (percentage), not just STDEV × √252. Slight difference.
+
+Our ticker_rolling_calculations entity with calc_type and window_days can handle all these. Should I update the entity and create the expanded SP?
+
+
+

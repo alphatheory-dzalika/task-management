@@ -9,7 +9,12 @@ Much progress has been made on the FactSet ticker pricing orchestration system.
 
 What is it? Why do we need it? What are the outputs? 
 
+------------
 
+1/14/2026 ... beginning to introduce the Ticker Resolver system Find or Create Ticker as part of the Sec Master upcoming work
+
+Components:
+* Read-state tables 
 
 
 
